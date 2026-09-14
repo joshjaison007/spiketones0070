@@ -1,0 +1,4144 @@
+import { desktopData, musicLibrary, fileContentMap } from './filesystem.js';
+import { 
+    fetchGuestbook, 
+    insertGuestbook, 
+    deleteGuestbookMessage,
+    subscribeGuestbook, 
+    saveDesktopData, 
+    saveWallpaper, 
+    saveMusicLibrary, 
+    savePinnedWindows,
+    loadRemoteConfig,
+    subscribeRemoteConfig,
+    loadLocalOverrides,
+    isFirebaseConfigured,
+    subscribeFirebaseStatus,
+    pingFirebase
+} from './database.js';
+
+// --- State Variables ---
+let currentDesktopData = [...desktopData];
+let currentMusicLibrary = [...musicLibrary];
+let currentWallpaper = "wall.png";
+let currentUser = localStorage.getItem("currentUser") || "guest";
+let isOwner = currentUser === "admin";
+
+let pinnedWindows = {};
+try {
+    const savedPinned = localStorage.getItem("st_pinned_windows");
+    if (savedPinned) pinnedWindows = JSON.parse(savedPinned);
+} catch (e) {
+    pinnedWindows = {};
+}
+
+let activeWindows = [];
+let activeGuestbookRender = null;
+let zIndexCounter = 100;
+let currentTrackIndex = 0;
+let isPlaying = false;
+let audio = new Audio();
+audio.crossOrigin = "anonymous";
+
+// Ensure CANCUN is selected first to match initial track
+const cancunIdx = currentMusicLibrary.findIndex(t => t.title.toUpperCase().includes('CANCUN'));
+if (cancunIdx !== -1) {
+    currentTrackIndex = cancunIdx;
+}
+
+// Initial local overrides fallback before remote fetch
+const initialOverrides = loadLocalOverrides();
+if (initialOverrides.desktopData) currentDesktopData = initialOverrides.desktopData;
+if (initialOverrides.wallpaper) {
+    currentWallpaper = initialOverrides.wallpaper;
+    document.body.style.backgroundImage = `url('${currentWallpaper}')`;
+    const lockBg = document.getElementById("lock-screen-bg");
+    if (lockBg) lockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+}
+if (initialOverrides.musicLibrary) currentMusicLibrary = initialOverrides.musicLibrary;
+
+// Helper to set wallpaper synchronously across desktop and lock screen
+export function setWallpaper(url) {
+    currentWallpaper = url;
+    document.body.style.backgroundImage = `url('${url}')`;
+    const desktop = document.getElementById("desktop");
+    if (desktop) desktop.style.backgroundImage = `url('${url}')`;
+    const lockBg = document.getElementById("lock-screen-bg");
+    if (lockBg) lockBg.style.backgroundImage = `url('${url}')`;
+    saveWallpaper(url);
+}
+
+// Sanitize and ensure core folders (Socials, Links, Music) are intact
+function sanitizeDesktopData(data) {
+    if (!Array.isArray(data) || data.length === 0) return [...desktopData];
+    const defaultSocials = desktopData.find(d => d.name === "Socials");
+    const defaultLinks = desktopData.find(d => d.name === "Links");
+    const defaultMusic = desktopData.find(d => d.name === "Music");
+
+    const result = data.map(item => {
+        if (item.name === "Socials") {
+            if (!item.content || item.content.length === 0) {
+                return { ...item, content: [...(defaultSocials ? defaultSocials.content : [])] };
+            }
+        }
+        if (item.name === "Links") {
+            if (!item.content || item.content.length === 0) {
+                return { ...item, content: [...(defaultLinks ? defaultLinks.content : [])] };
+            }
+        }
+        if (item.name === "Music") {
+            if (!item.content || item.content.length === 0) {
+                return { ...item, content: [...(defaultMusic ? defaultMusic.content : [])] };
+            }
+        }
+        return item;
+    });
+
+    if (!result.some(d => d.name === "Socials") && defaultSocials) {
+        result.unshift({ ...defaultSocials });
+    }
+    if (!result.some(d => d.name === "Links") && defaultLinks) {
+        result.push({ ...defaultLinks });
+    }
+    if (!result.some(d => d.name === "Music") && defaultMusic) {
+        result.push({ ...defaultMusic });
+    }
+    result.forEach(item => {
+        if ((item.type === "stickynotes" || item.name === "Sticky Notes") && item.customIcon === "fluent:note-pin-24-filled") {
+            delete item.customIcon;
+        }
+    });
+
+    if (!result.some(d => d.name === "Sticky Notes" || d.type === "stickynotes")) {
+        result.push({ name: "Sticky Notes", type: "stickynotes" });
+    }
+    return result;
+}
+
+currentDesktopData = sanitizeDesktopData(currentDesktopData);
+
+// --- Cryptographic Password Security (Web Crypto API SHA-256 + Salt) ---
+const SALT = "spiketones_salt_2026_secure_";
+// Default password hash for "password#1234"
+const DEFAULT_PIN_HASH = "3c22c849fe909764d5b44f9783856736a352178892feb5a3207f85f472a53619";
+
+async function computeSha256(text) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(SALT + text);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function getAdminPasswordHash() {
+    return localStorage.getItem("spiketones_admin_pin_hash") || DEFAULT_PIN_HASH;
+}
+
+export async function setAdminPassword(newPin) {
+    const hash = await computeSha256(newPin);
+    localStorage.setItem("spiketones_admin_pin_hash", hash);
+    return hash;
+}
+
+let currentLockSelectedUser = "admin";
+
+export function lockSystem() {
+    const lockScreen = document.getElementById("lock-screen");
+    if (!lockScreen) return;
+    const lockBg = document.getElementById("lock-screen-bg");
+    if (lockBg) lockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+    lockScreen.style.display = "flex";
+    lockScreen.style.opacity = "1";
+    lockScreen.style.transform = "none";
+    const errorMsg = document.getElementById("lock-error-msg");
+    if (errorMsg) errorMsg.textContent = "";
+
+    // Sync state with selected user
+    selectLockUser(currentLockSelectedUser || "guest");
+}
+
+export function unlockSystem(asUser = "guest") {
+    const lockScreen = document.getElementById("lock-screen");
+    if (lockScreen) {
+        lockScreen.style.opacity = "0";
+        lockScreen.style.transition = "opacity 0.22s ease, transform 0.22s ease";
+        lockScreen.style.transform = "scale(1.04)";
+        setTimeout(() => {
+            lockScreen.style.display = "none";
+            lockScreen.style.opacity = "1";
+            lockScreen.style.transform = "none";
+        }, 230);
+    }
+    currentUser = asUser;
+    localStorage.setItem("currentUser", asUser);
+    isOwner = asUser === "admin";
+    
+    // If guest, close any open admin-only windows like personalization
+    if (asUser !== "admin") {
+        const pWin = document.getElementById("win-personalization");
+        if (pWin) {
+            pWin.remove();
+            activeWindows = activeWindows.filter(w => w.id !== "win-personalization");
+        }
+        const oWin = document.getElementById("win-owner-edit");
+        if (oWin) {
+            oWin.remove();
+            activeWindows = activeWindows.filter(w => w.id !== "win-owner-edit");
+        }
+    }
+
+    updateUserUI();
+    renderDesktop();
+    renderStartMenuApps();
+    
+    if (asUser === "admin") {
+        showToast("Authenticated as SPIKETONES007 Admin!");
+        loadStickyNotes();
+        if (stickyNotes.length > 0) {
+            stickyNotes.forEach(n => renderStickyNoteElement(n));
+        }
+    } else {
+        // In Guest mode, sticky notes are cleared from the screen
+        const notesContainer = document.getElementById("sticky-notes-container");
+        if (notesContainer) notesContainer.innerHTML = "";
+        showToast("Welcome, Guest!");
+    }
+}
+
+export function submitGuestWelcome() {
+    const welcomeBtn = document.getElementById("lock-welcome-btn");
+    const spinner = document.getElementById("welcome-spinner");
+    const btnText = document.getElementById("welcome-btn-text");
+
+    if (welcomeBtn) welcomeBtn.disabled = true;
+    if (spinner) spinner.style.display = "inline-block";
+    if (btnText) btnText.style.display = "none";
+
+    // Authentic Windows 11 welcome spinner delay before unlocking
+    setTimeout(() => {
+        unlockSystem("guest");
+        if (welcomeBtn) welcomeBtn.disabled = false;
+        if (spinner) spinner.style.display = "none";
+        if (btnText) btnText.style.display = "inline";
+    }, 650);
+}
+
+export async function handleLockSubmit(e) {
+    if (e) e.preventDefault();
+    if (currentLockSelectedUser === "guest") {
+        submitGuestWelcome();
+        return;
+    }
+    const pinInput = document.getElementById("lock-pin-input");
+    const errorMsg = document.getElementById("lock-error-msg");
+    const enteredPin = (pinInput ? pinInput.value : "").trim();
+    
+    if (!enteredPin) {
+        if (errorMsg) errorMsg.textContent = "Please enter password.";
+        return;
+    }
+    
+    // Accept Password#Password, password#1234, Password#1234, 0007, or custom hash
+    const acceptedDirect = [
+        "password#1234",
+        "Password#1234",
+        "Password#Password",
+        "password#password",
+        "0007"
+    ];
+
+    let isMatch = acceptedDirect.includes(enteredPin);
+    if (!isMatch) {
+        const enteredHash = await computeSha256(enteredPin);
+        const correctHash = getAdminPasswordHash();
+        if (enteredHash === correctHash) isMatch = true;
+    }
+    
+    if (isMatch) {
+        if (errorMsg) errorMsg.textContent = "";
+        unlockSystem("admin");
+    } else {
+        if (errorMsg) errorMsg.textContent = "The password is incorrect. Try again.";
+        const wrap = document.querySelector(".lock-input-wrap");
+        if (wrap) {
+            wrap.classList.remove("shake");
+            void wrap.offsetWidth;
+            wrap.classList.add("shake");
+        }
+        if (pinInput) {
+            pinInput.value = "";
+            pinInput.focus();
+        }
+    }
+}
+
+export function selectLockUser(userType) {
+    currentLockSelectedUser = userType;
+    const tileAdmin = document.getElementById("lock-tile-admin");
+    const tileGuest = document.getElementById("lock-tile-guest");
+    const userName = document.getElementById("lock-user-name");
+    const form = document.getElementById("lock-form");
+    const guestWrap = document.getElementById("lock-guest-wrap");
+    const pinInput = document.getElementById("lock-pin-input");
+    const welcomeBtn = document.getElementById("lock-welcome-btn");
+    const spinner = document.getElementById("welcome-spinner");
+    const btnText = document.getElementById("welcome-btn-text");
+    
+    if (userType === "admin") {
+        if (tileAdmin) tileAdmin.classList.add("active");
+        if (tileGuest) tileGuest.classList.remove("active");
+        if (userName) userName.textContent = "SPIKETONES007";
+        if (form) form.style.display = "flex";
+        if (guestWrap) guestWrap.style.display = "none";
+        if (pinInput) {
+            pinInput.value = "";
+            setTimeout(() => pinInput.focus(), 120);
+        }
+    } else {
+        if (tileAdmin) tileAdmin.classList.remove("active");
+        if (tileGuest) tileGuest.classList.add("active");
+        if (userName) userName.textContent = "Guest";
+        if (form) form.style.display = "none";
+        if (guestWrap) guestWrap.style.display = "flex";
+        if (welcomeBtn) {
+            welcomeBtn.disabled = false;
+            if (spinner) spinner.style.display = "none";
+            if (btnText) btnText.style.display = "inline";
+            setTimeout(() => welcomeBtn.focus(), 120);
+        }
+    }
+}
+
+// --- Recursive Folder Finder Helper (Always accesses live reference in currentDesktopData) ---
+export function findFolderItem(name, list = currentDesktopData) {
+    if (!name || !Array.isArray(list)) return null;
+    const nameLower = name.toLowerCase();
+    for (const item of list) {
+        if (item.type === "folder" && item.name && item.name.toLowerCase() === nameLower) {
+            return item;
+        }
+        if (item.type === "folder" && Array.isArray(item.content)) {
+            const nested = findFolderItem(name, item.content);
+            if (nested) return nested;
+        }
+    }
+    return null;
+}
+
+// --- Fluent System Dialog Helpers (Non-blocking Custom Modals for iframe compatibility) ---
+export function showWinDialog({ title = "System", message = "", type = "alert", defaultValue = "", placeholder = "", confirmText = "OK", cancelText = "Cancel", isDanger = false }) {
+    return new Promise((resolve) => {
+        const existing = document.getElementById("win-fluent-dialog");
+        if (existing) existing.remove();
+
+        const backdrop = document.createElement("div");
+        backdrop.id = "win-fluent-dialog";
+        backdrop.className = "win-dialog-backdrop";
+
+        let bodyContent = `<p class="win-dialog-msg">${escapeHTML(message).replace(/\n/g, '<br/>')}</p>`;
+        if (type === "prompt") {
+            bodyContent += `<input type="text" id="win-dlg-input" class="win-dialog-input" value="${escapeHTML(defaultValue)}" placeholder="${escapeHTML(placeholder)}" autocomplete="off" />`;
+        }
+
+        const showCancel = type === "confirm" || type === "prompt";
+        const primaryClass = isDanger ? "danger" : "primary";
+
+        backdrop.innerHTML = `
+            <div class="win-dialog-box" role="dialog" aria-modal="true">
+                <div class="win-dialog-header">
+                    <span class="win-dialog-title">${escapeHTML(title)}</span>
+                    <button class="win-dialog-close" id="win-dlg-close">&times;</button>
+                </div>
+                <div class="win-dialog-body">
+                    ${bodyContent}
+                </div>
+                <div class="win-dialog-footer">
+                    ${showCancel ? `<button class="win-dialog-btn cancel" id="win-dlg-cancel">${escapeHTML(cancelText)}</button>` : ''}
+                    <button class="win-dialog-btn ${primaryClass}" id="win-dlg-confirm">${escapeHTML(confirmText)}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(backdrop);
+
+        const inputEl = backdrop.querySelector("#win-dlg-input");
+        const confirmBtn = backdrop.querySelector("#win-dlg-confirm");
+        const cancelBtn = backdrop.querySelector("#win-dlg-cancel");
+        const closeBtn = backdrop.querySelector("#win-dlg-close");
+
+        if (inputEl) {
+            setTimeout(() => {
+                inputEl.focus();
+                inputEl.select();
+            }, 60);
+        } else {
+            setTimeout(() => confirmBtn && confirmBtn.focus(), 60);
+        }
+
+        const cleanup = () => {
+            backdrop.remove();
+        };
+
+        const handleConfirm = () => {
+            cleanup();
+            if (type === "prompt") {
+                resolve(inputEl ? inputEl.value : defaultValue);
+            } else if (type === "confirm") {
+                resolve(true);
+            } else {
+                resolve(true);
+            }
+        };
+
+        const handleCancel = () => {
+            cleanup();
+            if (type === "prompt") {
+                resolve(null);
+            } else if (type === "confirm") {
+                resolve(false);
+            } else {
+                resolve(false);
+            }
+        };
+
+        confirmBtn.addEventListener("click", handleConfirm);
+        if (cancelBtn) cancelBtn.addEventListener("click", handleCancel);
+        closeBtn.addEventListener("click", handleCancel);
+        backdrop.addEventListener("click", (e) => {
+            if (e.target === backdrop) handleCancel();
+        });
+
+        backdrop.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                handleConfirm();
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                handleCancel();
+            }
+        });
+    });
+}
+
+export function winConfirm(message, title = "Confirm", isDanger = false) {
+    return showWinDialog({ title, message, type: "confirm", confirmText: isDanger ? "Delete" : "OK", isDanger });
+}
+
+export function winPrompt(message, defaultValue = "", title = "Input", placeholder = "") {
+    return showWinDialog({ title, message, type: "prompt", defaultValue, placeholder, confirmText: "OK" });
+}
+
+export function winAlert(message, title = "Notice") {
+    return showWinDialog({ title, message, type: "alert", confirmText: "OK" });
+}
+
+// --- Windows 11 Fluent Add New Link Modal (Supports custom title, url & custom icon/cover upload) ---
+export function showNewLinkDialog(targetFolder = null) {
+    const existing = document.getElementById("win-new-link-dialog");
+    if (existing) existing.remove();
+
+    const backdrop = document.createElement("div");
+    backdrop.id = "win-new-link-dialog";
+    backdrop.className = "win-dialog-backdrop";
+
+    const targetName = targetFolder ? targetFolder.name : "Desktop";
+
+    backdrop.innerHTML = `
+        <div class="win-dialog-box" style="max-width: 440px;" role="dialog" aria-modal="true">
+            <div class="win-dialog-header">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <iconify-icon icon="fluent:link-add-24-filled" width="18" height="18" style="color: #00a2ed;"></iconify-icon>
+                    <span class="win-dialog-title">Add Web Link (${escapeHTML(targetName)})</span>
+                </div>
+                <button class="win-dialog-close" id="dlg-link-close">&times;</button>
+            </div>
+            <div class="win-dialog-body">
+                <div>
+                    <label style="display: block; font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); text-transform: uppercase; margin-bottom: 6px;">Link Name / Title</label>
+                    <input type="text" id="dlg-link-title" class="win-dialog-input" placeholder="e.g. GitHub, Reddit, Twitch, Portfolio" autocomplete="off" />
+                </div>
+                <div>
+                    <label style="display: block; font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); text-transform: uppercase; margin-bottom: 6px;">Web URL</label>
+                    <input type="url" id="dlg-link-url" class="win-dialog-input" placeholder="e.g. https://github.com/..." autocomplete="off" />
+                </div>
+                <div>
+                    <label style="display: block; font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); text-transform: uppercase; margin-bottom: 6px;">Custom Cover / Icon (Optional)</label>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div id="dlg-link-preview" style="width: 46px; height: 46px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px dashed rgba(255,255,255,0.25); display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0;">
+                            <iconify-icon icon="fluent:link-24-filled" width="24" height="24" style="color: #00a2ed;"></iconify-icon>
+                        </div>
+                        <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                            <button type="button" class="win-dialog-btn cancel" id="dlg-link-cover-btn" style="width: 100%; text-align: center; padding: 6px 10px; font-size: 12px;">
+                                Choose Image File...
+                            </button>
+                            <input type="file" id="dlg-link-file" accept="image/*" style="display: none;" />
+                            <span id="dlg-link-filename" style="font-size: 10px; color: rgba(255,255,255,0.45); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">Default web icon will be used if left blank</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="win-dialog-footer">
+                <button class="win-dialog-btn cancel" id="dlg-link-cancel">Cancel</button>
+                <button class="win-dialog-btn primary" id="dlg-link-submit">Create Link</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(backdrop);
+
+    let chosenCoverDataUrl = null;
+    const titleInput = backdrop.querySelector("#dlg-link-title");
+    const urlInput = backdrop.querySelector("#dlg-link-url");
+    const previewEl = backdrop.querySelector("#dlg-link-preview");
+    const fileInput = backdrop.querySelector("#dlg-link-file");
+    const coverBtn = backdrop.querySelector("#dlg-link-cover-btn");
+    const filenameLabel = backdrop.querySelector("#dlg-link-filename");
+
+    setTimeout(() => titleInput && titleInput.focus(), 60);
+
+    coverBtn.addEventListener("click", () => fileInput.click());
+
+    fileInput.addEventListener("change", () => {
+        if (fileInput.files && fileInput.files[0]) {
+            const file = fileInput.files[0];
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                chosenCoverDataUrl = ev.target.result;
+                previewEl.innerHTML = `<img src="${chosenCoverDataUrl}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 6px;" />`;
+                filenameLabel.textContent = file.name;
+                filenameLabel.style.color = "#4cd137";
+            };
+            reader.readAsDataURL(file);
+        }
+    });
+
+    const closeDialog = () => {
+        backdrop.remove();
+    };
+
+    backdrop.querySelector("#dlg-link-close").addEventListener("click", closeDialog);
+    backdrop.querySelector("#dlg-link-cancel").addEventListener("click", closeDialog);
+    backdrop.addEventListener("click", (e) => {
+        if (e.target === backdrop) closeDialog();
+    });
+
+    const doSubmit = () => {
+        const title = titleInput.value.trim();
+        let rawUrl = urlInput.value.trim();
+        if (!title) {
+            titleInput.focus();
+            showToast("Please enter a link title or name");
+            return;
+        }
+        if (!rawUrl) {
+            urlInput.focus();
+            showToast("Please enter a URL for the link");
+            return;
+        }
+
+        if (!/^https?:\/\//i.test(rawUrl)) {
+            rawUrl = "https://" + rawUrl;
+        }
+
+        const newLink = {
+            name: title,
+            type: "link",
+            url: rawUrl,
+            cover: chosenCoverDataUrl || null,
+            customIcon: chosenCoverDataUrl || null
+        };
+
+        if (targetFolder) {
+            const liveFolder = findFolderItem(targetFolder.name) || targetFolder;
+            if (!liveFolder.content) liveFolder.content = [];
+            liveFolder.content.push(newLink);
+            openFolderWindow(liveFolder);
+        } else {
+            currentDesktopData.push(newLink);
+            renderDesktop();
+        }
+
+        saveDesktopData(currentDesktopData);
+        closeDialog();
+        showToast(`Created link "${title}"`);
+    };
+
+    backdrop.querySelector("#dlg-link-submit").addEventListener("click", doSubmit);
+    backdrop.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            doSubmit();
+        } else if (e.key === "Escape") {
+            e.preventDefault();
+            closeDialog();
+        }
+    });
+}
+
+export async function showForgotPinPrompt() {
+    const code = await winPrompt("Admin Recovery / Reset PIN:\nEnter new secret PIN (or type 0007):", "0007", "Admin PIN Recovery");
+    if (code !== null && code.trim().length > 0) {
+        await setAdminPassword(code.trim());
+        showToast("New secret PIN saved & securely hashed! Please enter your new PIN to sign in.");
+        const pinInput = document.getElementById("lock-pin-input");
+        if (pinInput) pinInput.focus();
+    }
+}
+
+export function toggleSignInOptions() {
+    const pinInput = document.getElementById("lock-pin-input");
+    if (!pinInput) return;
+    if (pinInput.type === "password") {
+        pinInput.type = "text";
+        pinInput.placeholder = "Password / PIN";
+        showToast("Password visibility toggled");
+    } else {
+        pinInput.type = "password";
+        pinInput.placeholder = "PIN";
+    }
+}
+
+// --- Notification Toast ---
+function showToast(message, isSuccess = true) {
+    const existing = document.querySelector(".owner-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.className = "owner-toast";
+    toast.innerHTML = `<span>${isSuccess ? '✓' : 'ℹ'}</span> <span>${escapeHTML(message)}</span>`;
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transition = 'opacity 0.3s ease';
+        setTimeout(() => toast.remove(), 300);
+    }, 3200);
+}
+
+// --- Icon Resolution Helper ---
+function getIconMetadata(item) {
+    if (item.type === "folder") return { icon: "fluent:folder-24-filled", color: "#f8d45c" };
+    if (item.type === "file") return { icon: "fluent:document-24-filled", color: "#f5f5f5" };
+    if (item.type === "image") return { icon: "fluent:image-24-filled", color: "#00a2ed" };
+    if (item.type === "guestbook") return { icon: "fluent:chat-bubbles-question-24-filled", color: "#c85627" };
+    if (item.type === "music") return { icon: "fluent:music-note-2-24-filled", color: "#ff8c00" };
+    if (item.type === "link") return { icon: "fluent:link-24-filled", color: "#00a2ed" };
+    if (item.type === "calculator") return { icon: "fluent:calculator-24-filled", color: "#00a2ed" };
+    if (item.type === "paint") return { icon: "fluent:paint-brush-24-filled", color: "#e056fd" };
+    if (item.type === "terminal") return { icon: "fluent:window-console-20-filled", color: "#2ed573" };
+    if (item.type === "snake") return { icon: "fluent:games-24-filled", color: "#ffa502" };
+    if (item.type === "stickynotes" || item.name === "Sticky Notes") return { icon: "fluent:note-24-filled", color: "#ffd32a" };
+    return { icon: "fluent:app-folder-24-filled", color: "#cccccc" };
+}
+
+function getIconHTML(item, size = "large") {
+    const dim = size === "large" ? 44 : size === "medium" ? 34 : 22;
+    const nameLower = (item.name || "").toLowerCase();
+
+    // Check for custom cover art (image data URL or image path) first
+    if (item.cover || (item.customIcon && (item.customIcon.startsWith('data:') || item.customIcon.includes('/') || item.customIcon.includes('.')))) {
+        const coverSrc = item.cover || item.customIcon;
+        const meta = getIconMetadata(item);
+        return `<img src="${coverSrc}" class="custom-icon-cover" style="width: ${dim}px; height: ${dim}px; border-radius: 8px; object-fit: cover;" onerror="this.outerHTML='<iconify-icon icon=\\'${meta.icon}\\' width=\\'${dim}\\' height=\\'${dim}\\' style=\\'color: ${meta.color};\\'></iconify-icon>';" />`;
+    }
+
+    // Specific Brand SVGs for 100% guarantee visibility & crisp Windows 11 look
+    if (nameLower === "youtube") {
+        return `<svg width="${dim}" height="${dim}" viewBox="0 0 24 24" fill="#FF0000" style="filter: drop-shadow(0 2px 6px rgba(255,0,0,0.35));"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>`;
+    }
+    if (nameLower === "discord") {
+        return `<svg width="${dim}" height="${dim}" viewBox="0 0 24 24" fill="#5865F2" style="filter: drop-shadow(0 2px 6px rgba(88,101,242,0.35));"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>`;
+    }
+    if (item.type === "stickynotes" || nameLower === "sticky notes") {
+        return `<svg width="${dim}" height="${dim}" viewBox="0 0 48 48" fill="none" style="filter: drop-shadow(0 3px 8px rgba(255, 185, 0, 0.45));">
+            <rect x="6" y="6" width="36" height="36" rx="7" fill="#FFB900"/>
+            <path d="M6 30L18 42H13C9.134 42 6 38.866 6 35V30Z" fill="#E6A500"/>
+            <path d="M6 30H18V42L6 30Z" fill="#FFF1B8"/>
+            <line x1="12" y1="16" x2="36" y2="16" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.9"/>
+            <line x1="12" y1="23" x2="30" y2="23" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.9"/>
+        </svg>`;
+    }
+
+    if (item.customIcon) {
+        return `<iconify-icon icon="${item.customIcon}" width="${dim}" height="${dim}"></iconify-icon>`;
+    }
+    const meta = getIconMetadata(item);
+    return `<iconify-icon icon="${meta.icon}" width="${dim}" height="${dim}" style="color: ${meta.color}"></iconify-icon>`;
+}
+
+// --- Desktop Rendering ---
+function renderDesktop() {
+    const container = document.getElementById("desktopIcons");
+    if (!container) return;
+    container.innerHTML = "";
+    
+    currentDesktopData.forEach((item, index) => {
+        // Sticky Notes is exclusive to SPIKETONES007 admin
+        if (currentUser !== "admin" && (item.type === "stickynotes" || item.name === "Sticky Notes")) {
+            return;
+        }
+        // Hidden for guest feature
+        if (currentUser !== "admin" && item.hiddenForGuest) {
+            return;
+        }
+
+        const iconDiv = document.createElement("div");
+        iconDiv.className = "icon";
+        iconDiv.id = `desktop-icon-${index}`;
+        iconDiv.setAttribute("data-index", index);
+        iconDiv.setAttribute("data-name", item.name);
+
+        let badgeHTML = "";
+        if (currentUser === "admin" && item.hiddenForGuest) {
+            badgeHTML = `<div class="hidden-for-guest-badge" title="Hidden for guest"><iconify-icon icon="fluent:eye-off-24-filled" width="13" height="13"></iconify-icon></div>`;
+        }
+
+        iconDiv.innerHTML = `
+            ${badgeHTML}
+            ${getIconHTML(item, "large")}
+            <span>${escapeHTML(item.name)}</span>
+        `;
+        iconDiv.addEventListener("click", () => handleItemClick(item));
+
+        // Drag & drop icon re-arranging and folder dropping for Admin
+        if (currentUser === "admin") {
+            iconDiv.setAttribute("draggable", "true");
+            iconDiv.addEventListener("dragstart", (e) => {
+                e.dataTransfer.setData("application/json", JSON.stringify({ source: "desktop", index }));
+                iconDiv.classList.add("dragging");
+            });
+            iconDiv.addEventListener("dragend", () => {
+                iconDiv.classList.remove("dragging");
+            });
+
+            if (item.type === "folder") {
+                iconDiv.addEventListener("dragover", (e) => {
+                    e.preventDefault();
+                    iconDiv.classList.add("folder-drop-hover");
+                });
+                iconDiv.addEventListener("dragleave", () => {
+                    iconDiv.classList.remove("folder-drop-hover");
+                });
+                iconDiv.addEventListener("drop", (e) => {
+                    e.preventDefault();
+                    iconDiv.classList.remove("folder-drop-hover");
+                    try {
+                        const raw = e.dataTransfer.getData("application/json");
+                        if (!raw) return;
+                        const data = JSON.parse(raw);
+                        if (data.source === "desktop" && typeof data.index === "number" && data.index !== index) {
+                            const [moved] = currentDesktopData.splice(data.index, 1);
+                            if (!item.content) item.content = [];
+                            item.content.push(moved);
+                            saveDesktopData(currentDesktopData);
+                            renderDesktop();
+                            showToast(`Moved "${moved.name}" into "${item.name}"`);
+                        }
+                    } catch (err) {
+                        console.error("Drop error:", err);
+                    }
+                });
+            }
+        }
+
+        container.appendChild(iconDiv);
+    });
+
+    // If logged in as Admin, show Admin Settings icon on desktop
+    if (currentUser === "admin") {
+        const adminIconDiv = document.createElement("div");
+        adminIconDiv.className = "icon admin-desktop-icon";
+        adminIconDiv.id = "desktop-icon-admin";
+        adminIconDiv.innerHTML = `
+            <iconify-icon icon="fluent:settings-24-filled" width="44" height="44" style="color: #ff8c00; filter: drop-shadow(0 2px 8px rgba(255, 140, 0, 0.4));"></iconify-icon>
+            <span>Admin Settings</span>
+        `;
+        adminIconDiv.addEventListener("click", () => openAdminEditMode());
+        container.appendChild(adminIconDiv);
+    }
+}
+
+// --- Item Click Handler ---
+function handleItemClick(item) {
+    if (!item) return;
+    if (item.type === "folder") {
+        openFolderWindow(item);
+    } else if (item.type === "file") {
+        openNotepad(item.name);
+    } else if (item.type === "image") {
+        openImageViewer(item);
+    } else if (item.type === "guestbook") {
+        openGuestbook();
+    } else if (item.type === "admin_settings") {
+        openAdminEditMode();
+    } else if (item.type === "calculator" || item.type === "calc") {
+        openCalculator();
+    } else if (item.type === "paint") {
+        openPaint();
+    } else if (item.type === "terminal") {
+        openTerminal();
+    } else if (item.type === "snake") {
+        openSnake();
+    } else if (item.type === "stickynotes" || item.name === "Sticky Notes") {
+        openStickyNotes();
+    } else if (item.type === "link") {
+        if (item.url) {
+            try {
+                const opened = window.open(item.url, "_blank", "noopener,noreferrer");
+                if (!opened) {
+                    const a = document.createElement("a");
+                    a.href = item.url;
+                    a.target = "_blank";
+                    a.rel = "noopener noreferrer";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                }
+            } catch (e) {
+                const a = document.createElement("a");
+                a.href = item.url;
+                a.target = "_blank";
+                a.rel = "noopener noreferrer";
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            }
+        }
+    } else if (item.type === "music") {
+        playTrackBySrc(item.src, item.name);
+    }
+}
+
+// --- Windows Management ---
+function bringToFront(win) {
+    zIndexCounter++;
+    win.style.zIndex = zIndexCounter;
+}
+
+export function openWindow(title, contentHTML, iconHTML = "", customId = null, extraClass = "") {
+    const id = customId || `win-${Date.now()}`;
+    const existing = document.getElementById(id);
+    if (existing) {
+        existing.classList.remove("minimized");
+        bringToFront(existing);
+        updateTaskbar();
+        return existing;
+    }
+
+    const win = document.createElement("div");
+    win.className = `window ${extraClass}`;
+    win.id = id;
+    
+    // Check if pinned position exists for this window (spawn location)
+    const pinned = pinnedWindows[id] || pinnedWindows[title];
+    if (pinned) {
+        win.style.top = `${pinned.top}px`;
+        win.style.left = `${pinned.left}px`;
+        if (pinned.width) win.style.width = `${pinned.width}px`;
+        if (pinned.height) win.style.height = `${pinned.height}px`;
+        win.style.bottom = "auto";
+        win.style.right = "auto";
+    } else if (!extraClass.includes("guestbook-panel")) {
+        const offset = (activeWindows.length * 24) % 120;
+        win.style.top = `${80 + offset}px`;
+        win.style.left = `${70 + offset}px`;
+    }
+
+    const isPinned = !!pinned;
+    const pinBtnHTML = currentUser === 'admin' ? `
+        <button class="win-btn pin-btn ${isPinned ? 'pinned' : ''}" id="pin-${id}" title="Pin window spawn location for guests">
+            <iconify-icon icon="fluent:pin-24-filled" width="13" height="13"></iconify-icon>
+        </button>
+    ` : '';
+
+    win.innerHTML = `
+        <div class="window-header">
+            <div class="window-title">${iconHTML} <span>${title}</span></div>
+            <div class="window-controls">
+                ${pinBtnHTML}
+                <button class="win-btn minimize" title="Minimize">_</button>
+                <button class="win-btn maximize" title="Maximize">🗖</button>
+                <button class="win-btn close" title="Close">✕</button>
+            </div>
+        </div>
+        <div class="window-body">${contentHTML}</div>
+    `;
+
+    // Locked size for Guest folder windows
+    if (currentUser !== "admin" && extraClass.includes("folder-window")) {
+        const maxBtn = win.querySelector(".maximize");
+        if (maxBtn) maxBtn.style.display = "none";
+        win.style.resize = "none";
+    }
+
+    document.getElementById("window-container").appendChild(win);
+    bringToFront(win);
+
+    // Draggable header
+    const header = win.querySelector(".window-header");
+    let isDragging = false;
+    let startX = 0, startY = 0, initialLeft = 0, initialTop = 0;
+
+    const onMouseDown = (e) => {
+        if (e.target.closest(".window-controls")) return;
+        isDragging = true;
+        bringToFront(win);
+        const rect = win.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        initialLeft = rect.left;
+        initialTop = rect.top;
+
+        const onMouseMove = (moveEvent) => {
+            if (!isDragging) return;
+            const dx = moveEvent.clientX - startX;
+            const dy = moveEvent.clientY - startY;
+            win.style.left = `${initialLeft + dx}px`;
+            win.style.top = `${initialTop + dy}px`;
+            win.style.bottom = "auto";
+            win.style.right = "auto";
+        };
+
+        const onMouseUp = () => {
+            isDragging = false;
+            document.removeEventListener("mousemove", onMouseMove);
+            document.removeEventListener("mouseup", onMouseUp);
+        };
+
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseup", onMouseUp);
+    };
+
+    header.addEventListener("mousedown", onMouseDown);
+    win.addEventListener("mousedown", () => bringToFront(win));
+
+    // Pin Button (Admin Only: Pin Spawn Location)
+    const pinBtn = win.querySelector(`#pin-${id}`);
+    if (pinBtn) {
+        pinBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const rect = win.getBoundingClientRect();
+            pinnedWindows[id] = {
+                top: Math.round(rect.top),
+                left: Math.round(rect.left),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                title: title
+            };
+            pinnedWindows[title] = pinnedWindows[id];
+            savePinnedWindows(pinnedWindows);
+            pinBtn.classList.add("pinned");
+            showToast(`📌 Pinned spawn location for "${title}" for guests!`);
+        });
+    }
+
+    // Controls
+    win.querySelector(".minimize").addEventListener("click", () => {
+        win.classList.add("minimized");
+        updateTaskbar();
+    });
+
+    const maxBtn = win.querySelector(".maximize");
+    if (maxBtn) {
+        maxBtn.addEventListener("click", () => {
+            win.classList.toggle("maximized");
+            maxBtn.textContent = win.classList.contains("maximized") ? "🗗" : "🗖";
+        });
+    }
+
+    win.querySelector(".close").addEventListener("click", () => {
+        win.remove();
+        activeWindows = activeWindows.filter(w => w.id !== id);
+        updateTaskbar();
+    });
+
+    activeWindows.push({ id, title, iconHTML });
+    updateTaskbar();
+    return win;
+}
+
+// Currently targeted folder for file uploads & context actions
+let currentTargetFolder = null;
+
+// --- Folder Window with Bottom Right Upload (Admin Only) & Right-Click Management ---
+function openFolderWindow(folderItem) {
+    currentTargetFolder = folderItem;
+    const winId = `win-${folderItem.name.toLowerCase().replace(/\s+/g, '-')}`;
+    const isMusic = folderItem.name.toLowerCase() === "music";
+    
+    // Close existing to re-render fresh content
+    const existing = document.getElementById(winId);
+    if (existing) {
+        existing.remove();
+        activeWindows = activeWindows.filter(w => w.id !== winId);
+    }
+    
+    let itemsHTML = `
+        <div class="folder-header-bar">
+            <div class="folder-path-text">📁 C:\\Users\\SPIKETONES\\${escapeHTML(folderItem.name)}</div>
+            ${currentUser === "admin" ? `
+            <div class="folder-header-actions">
+                <button class="folder-action-btn mini" id="btn-hdr-newfolder-${winId}" title="New Folder">
+                    <iconify-icon icon="fluent:folder-add-24-filled" width="13" height="13"></iconify-icon>
+                    <span>New Folder</span>
+                </button>
+                <button class="folder-action-btn mini" id="btn-hdr-newfile-${winId}" title="New Text Document">
+                    <iconify-icon icon="fluent:document-add-24-filled" width="13" height="13"></iconify-icon>
+                    <span>New File</span>
+                </button>
+                <button class="folder-action-btn mini" id="btn-hdr-newlink-${winId}" title="New Web Link">
+                    <iconify-icon icon="fluent:link-add-24-filled" width="13" height="13" style="color: #00a2ed;"></iconify-icon>
+                    <span>New Link</span>
+                </button>
+            </div>
+            ` : ''}
+        </div>
+        <div class="folder-content-wrap" id="folder-wrap-${winId}">
+    `;
+    
+    const children = folderItem.content || [];
+    let visibleCount = 0;
+    children.forEach((child, cIdx) => {
+        // Restriction: Hidden for guest
+        if (currentUser !== "admin" && child.hiddenForGuest) {
+            return;
+        }
+        visibleCount++;
+        let badgeHTML = "";
+        if (currentUser === "admin" && child.hiddenForGuest) {
+            badgeHTML = `<div class="hidden-for-guest-badge" title="Hidden for guest"><iconify-icon icon="fluent:eye-off-24-filled" width="13" height="13"></iconify-icon></div>`;
+        }
+        itemsHTML += `
+            <div class="icon folder-child" data-idx="${cIdx}" id="item-${winId}-${cIdx}">
+                ${badgeHTML}
+                ${getIconHTML(child, "large")}
+                <span>${escapeHTML(child.name)}</span>
+            </div>
+        `;
+    });
+
+    if (visibleCount === 0) {
+        itemsHTML += `
+            <div style="width: 100%; text-align: center; color: rgba(255,255,255,0.4); padding: 40px 10px; font-size: 13px;">
+                This folder is empty.
+            </div>
+        `;
+    }
+
+    itemsHTML += `</div>`;
+
+    // Bottom right corner upload bar strictly for Admin
+    if (currentUser === "admin") {
+        itemsHTML += `
+            <div class="folder-bottom-bar">
+                <button class="folder-action-btn primary folder-corner-upload-btn" id="btn-corner-upload-${winId}" title="${isMusic ? 'Upload audio track with custom album cover' : 'Upload file to folder'}">
+                    <iconify-icon icon="${isMusic ? 'fluent:music-note-2-24-filled' : 'fluent:arrow-upload-24-filled'}" width="14" height="14"></iconify-icon>
+                    <span>${isMusic ? 'Upload Music & Cover' : 'Upload File'}</span>
+                </button>
+            </div>
+        `;
+    }
+
+    const folderIcon = isMusic 
+        ? `<iconify-icon icon="fluent:music-note-2-24-filled" width="18" height="18" style="color: #ff8c00"></iconify-icon>`
+        : `<iconify-icon icon="fluent:folder-24-filled" width="18" height="18" style="color: #f8d45c"></iconify-icon>`;
+    const win = openWindow(folderItem.name, itemsHTML, folderIcon, winId, "folder-window");
+    win.folderItemRef = folderItem;
+    win.setAttribute("data-folder-name", folderItem.name);
+
+    // Bind item clicks
+    const childEls = win.querySelectorAll(".folder-child");
+    childEls.forEach(el => {
+        const idx = parseInt(el.getAttribute("data-idx"), 10);
+        const childItem = children[idx];
+        el.addEventListener("click", () => handleItemClick(childItem));
+    });
+
+    // Bind header actions for Admin
+    const hdrNewFolderBtn = win.querySelector(`#btn-hdr-newfolder-${winId}`);
+    if (hdrNewFolderBtn) {
+        hdrNewFolderBtn.addEventListener("click", async () => {
+            const liveFolder = findFolderItem(folderItem.name) || folderItem;
+            let defaultName = "New Folder";
+            let counter = 2;
+            while (liveFolder.content && liveFolder.content.some(item => item.name === defaultName)) {
+                defaultName = `New Folder (${counter++})`;
+            }
+            const name = await winPrompt("Enter folder name:", defaultName, "Create Folder");
+            if (name && name.trim()) {
+                if (!liveFolder.content) liveFolder.content = [];
+                liveFolder.content.push({ name: name.trim(), type: "folder", content: [] });
+                saveDesktopData(currentDesktopData);
+                openFolderWindow(liveFolder);
+                showToast(`Created folder "${name.trim()}"`);
+            }
+        });
+    }
+
+    const hdrNewFileBtn = win.querySelector(`#btn-hdr-newfile-${winId}`);
+    if (hdrNewFileBtn) {
+        hdrNewFileBtn.addEventListener("click", async () => {
+            const liveFolder = findFolderItem(folderItem.name) || folderItem;
+            let defaultName = "New Document.txt";
+            let counter = 2;
+            while (liveFolder.content && liveFolder.content.some(item => item.name === defaultName)) {
+                defaultName = `New Document (${counter++}).txt`;
+            }
+            let name = await winPrompt("Enter document name:", defaultName, "Create Text Document");
+            if (name && name.trim()) {
+                name = name.trim();
+                if (!name.endsWith(".txt")) name += ".txt";
+                if (!liveFolder.content) liveFolder.content = [];
+                liveFolder.content.push({ name, type: "file" });
+                fileContentMap[name] = "";
+                saveDesktopData(currentDesktopData);
+                openFolderWindow(liveFolder);
+                openNotepad(name, "");
+                showToast(`Created file "${name}"`);
+            }
+        });
+    }
+
+    const hdrNewLinkBtn = win.querySelector(`#btn-hdr-newlink-${winId}`);
+    if (hdrNewLinkBtn) {
+        hdrNewLinkBtn.addEventListener("click", () => {
+            const liveFolder = findFolderItem(folderItem.name) || folderItem;
+            showNewLinkDialog(liveFolder);
+        });
+    }
+
+    // Bind corner upload button for Admin
+    const cornerUploadBtn = win.querySelector(`#btn-corner-upload-${winId}`);
+    if (cornerUploadBtn) {
+        cornerUploadBtn.addEventListener("click", () => {
+            const liveFolder = findFolderItem(folderItem.name) || folderItem;
+            currentTargetFolder = liveFolder;
+            if (isMusic) {
+                openMusicUploadModal(liveFolder);
+            } else {
+                const uploader = document.getElementById("folder-file-uploader");
+                if (uploader) uploader.click();
+            }
+        });
+    }
+}
+
+// --- Notepad with Save Capability ---
+export function openNotepad(fileName = "text.txt", initialText = null) {
+    const winId = `win-notepad-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const fileIcon = `<iconify-icon icon="fluent:document-24-filled" width="18" height="18" style="color: #e0e0e0"></iconify-icon>`;
+    
+    let content = initialText;
+    if (content === null) {
+        content = localStorage.getItem(`file_${fileName}`);
+    }
+    if (content === null) {
+        content = `  ___ ___ ___ _  _______ ___  _  _ ___ ___  ___  ___ _____ \n / __| _ \\_ _| |/ /_   _/ _ \\| \\| | __/ __|/ _ \\/ _ \\__  / \n \\__ \\  _/| || ' <  | || (_) | .\` | _|\\__ \\ (_) | (_) / /  \n |___/_| |___|_|\\_\\ |_| \\___/|_|\\_|___|___/\\___/\\___/_/     \n\n please report any bugs, really appreciate it\n\n More stuff coming soon :D\n`;
+    }
+
+    const isAdmin = currentUser === "admin";
+    const saveBtnHTML = isAdmin ? `
+        <button class="notepad-btn" id="btn-save-${winId}" title="Save file to virtual filesystem">
+            <iconify-icon icon="fluent:save-24-filled" width="14" height="14"></iconify-icon>
+            <span>Save</span>
+        </button>
+    ` : '';
+    const statusText = isAdmin ? escapeHTML(fileName) : `${escapeHTML(fileName)} (Read-only)`;
+
+    const bodyHTML = `
+        <div class="notepad-bar">
+            ${saveBtnHTML}
+            <span class="notepad-status" id="status-${winId}">${statusText}</span>
+        </div>
+        <textarea class="notepad-textarea" id="text-${winId}" ${isAdmin ? '' : 'readonly'} spellcheck="false">${escapeHTML(content)}</textarea>
+    `;
+    
+    const win = openWindow(fileName, bodyHTML, fileIcon, winId, "notepad-window");
+    
+    const saveBtn = win.querySelector(`#btn-save-${winId}`);
+    const ta = win.querySelector(`#text-${winId}`);
+    const statusEl = win.querySelector(`#status-${winId}`);
+    
+    if (saveBtn && ta) {
+        saveBtn.addEventListener("click", () => {
+            if (currentUser !== "admin") {
+                showToast("Only SPIKETONES007 can save files.");
+                return;
+            }
+            const updated = ta.value;
+            fileContentMap[fileName] = updated;
+            localStorage.setItem(`file_${fileName}`, updated);
+            saveDesktopData(currentDesktopData);
+            showToast(`Saved changes to "${fileName}"`);
+            if (statusEl) {
+                statusEl.textContent = "Saved ✓";
+                setTimeout(() => { if (statusEl) statusEl.textContent = fileName; }, 1800);
+            }
+        });
+    }
+
+    // Try fetching initial content if not already loaded and file exists on server
+    const filePath = fileContentMap[fileName] || `files/${fileName}`;
+    if (filePath && !localStorage.getItem(`file_${fileName}`) && initialText === null) {
+        fetch(filePath)
+            .then(res => res.ok ? res.text() : null)
+            .then(txt => {
+                if (txt && ta && !localStorage.getItem(`file_${fileName}`)) {
+                    ta.value = txt;
+                }
+            })
+            .catch(() => {});
+    }
+}
+
+// --- Image Viewer Window ---
+export function openImageViewer(imageItem) {
+    const winId = `win-img-${imageItem.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const imgIcon = `<iconify-icon icon="fluent:image-24-filled" width="18" height="18" style="color: #00a2ed"></iconify-icon>`;
+    const bodyHTML = `
+        <div style="display: flex; flex-direction: column; height: 100%; gap: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 2px 4px;">
+                <span style="font-size: 12px; color: rgba(255,255,255,0.7);">${escapeHTML(imageItem.name)}</span>
+                <button class="folder-action-btn primary" id="btn-set-wp-${winId}">🖼️ Set as Wallpaper</button>
+            </div>
+            <div style="flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: rgba(0,0,0,0.5); border-radius: 8px;">
+                <img src="${imageItem.src}" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+            </div>
+        </div>
+    `;
+    const win = openWindow(imageItem.name, bodyHTML, imgIcon, winId);
+    win.style.width = "480px";
+    win.style.height = "380px";
+    
+    const setWpBtn = win.querySelector(`#btn-set-wp-${winId}`);
+    if (setWpBtn) {
+        setWpBtn.addEventListener("click", () => {
+            currentWallpaper = imageItem.src;
+            document.body.style.backgroundImage = `url('${currentWallpaper}')`;
+            saveWallpaper(currentWallpaper);
+            showToast("Desktop wallpaper updated!");
+        });
+    }
+}
+
+// --- Interactive Apps: Calculator, Paint, Terminal, Snake ---
+export function openCalculator() {
+    const winId = "win-calculator";
+    const calcIcon = `<iconify-icon icon="fluent:calculator-24-filled" width="18" height="18" style="color: #00a2ed"></iconify-icon>`;
+    const bodyHTML = `
+        <div class="calc-container">
+            <div class="calc-display" id="calc-display">0</div>
+            <div class="calc-grid">
+                <button class="calc-btn op" data-val="C">C</button>
+                <button class="calc-btn op" data-val="+/-">±</button>
+                <button class="calc-btn op" data-val="%">%</button>
+                <button class="calc-btn op" data-val="/">÷</button>
+                
+                <button class="calc-btn" data-val="7">7</button>
+                <button class="calc-btn" data-val="8">8</button>
+                <button class="calc-btn" data-val="9">9</button>
+                <button class="calc-btn op" data-val="*">×</button>
+                
+                <button class="calc-btn" data-val="4">4</button>
+                <button class="calc-btn" data-val="5">5</button>
+                <button class="calc-btn" data-val="6">6</button>
+                <button class="calc-btn op" data-val="-">−</button>
+                
+                <button class="calc-btn" data-val="1">1</button>
+                <button class="calc-btn" data-val="2">2</button>
+                <button class="calc-btn" data-val="3">3</button>
+                <button class="calc-btn op" data-val="+">+</button>
+                
+                <button class="calc-btn" data-val="0" style="grid-column: span 2;">0</button>
+                <button class="calc-btn" data-val=".">.</button>
+                <button class="calc-btn eq" data-val="=">=</button>
+            </div>
+        </div>
+    `;
+    const win = openWindow("Calculator", bodyHTML, calcIcon, winId, "calc-window");
+    
+    let expr = "0";
+    const display = win.querySelector("#calc-display");
+    
+    win.querySelectorAll(".calc-btn").forEach(b => {
+        b.addEventListener("click", () => {
+            const val = b.getAttribute("data-val");
+            if (val === "C") {
+                expr = "0";
+            } else if (val === "=") {
+                try {
+                    const sanitized = expr.replace(/×/g, "*").replace(/÷/g, "/").replace(/−/g, "-");
+                    expr = String(Function(`"use strict"; return (${sanitized})`)());
+                } catch (e) {
+                    expr = "Error";
+                }
+            } else if (val === "+/-") {
+                if (expr.startsWith("-")) expr = expr.slice(1);
+                else if (expr !== "0") expr = "-" + expr;
+            } else if (val === "%") {
+                expr = String(parseFloat(expr) / 100);
+            } else {
+                if (expr === "0" || expr === "Error") expr = val;
+                else expr += val;
+            }
+            if (display) display.textContent = expr;
+        });
+    });
+}
+
+export function openPaint() {
+    const winId = "win-paint";
+    const paintIcon = `<iconify-icon icon="fluent:paint-brush-24-filled" width="18" height="18" style="color: #e056fd"></iconify-icon>`;
+    const bodyHTML = `
+        <div class="paint-container">
+            <div class="paint-toolbar">
+                <div class="paint-palette">
+                    <input type="color" id="paint-color" class="paint-color-picker" value="#ff8c00" title="Custom color picker" />
+                    <button type="button" class="paint-swatch" data-color="#000000" style="background:#000000;" title="Black"></button>
+                    <button type="button" class="paint-swatch" data-color="#ffffff" style="background:#ffffff;" title="White"></button>
+                    <button type="button" class="paint-swatch active" data-color="#ff8c00" style="background:#ff8c00;" title="Orange"></button>
+                    <button type="button" class="paint-swatch" data-color="#e84118" style="background:#e84118;" title="Red"></button>
+                    <button type="button" class="paint-swatch" data-color="#4cd137" style="background:#4cd137;" title="Green"></button>
+                    <button type="button" class="paint-swatch" data-color="#00a8ff" style="background:#00a8ff;" title="Blue"></button>
+                    <button type="button" class="paint-swatch" data-color="#9c88ff" style="background:#9c88ff;" title="Purple"></button>
+                    <button type="button" class="paint-swatch" data-color="#fbc531" style="background:#fbc531;" title="Yellow"></button>
+                </div>
+                <label style="font-size:12px; display:flex; align-items:center; gap:6px; color:#ffffff; margin-left: 4px;">
+                    <span>Size:</span>
+                    <input type="range" id="paint-size" min="1" max="36" value="4" style="width:70px; cursor:pointer;" />
+                    <span id="paint-size-label" style="font-size:11px; opacity:0.8; width:24px;">4px</span>
+                </label>
+                <div style="flex:1;"></div>
+                <button type="button" class="paint-tool-btn" id="paint-eraser">🧹 Eraser</button>
+                <button type="button" class="paint-tool-btn" id="paint-clear">🗑️ Clear</button>
+                <button type="button" class="paint-tool-btn primary" id="paint-save">💾 Save Image</button>
+            </div>
+            <div class="paint-canvas-wrap">
+                <canvas class="paint-canvas" id="paint-canvas" width="600" height="400"></canvas>
+            </div>
+        </div>
+    `;
+    const win = openWindow("Paint", bodyHTML, paintIcon, winId, "paint-window");
+    
+    const canvas = win.querySelector("#paint-canvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    let drawing = false;
+    let color = "#ff8c00";
+    let size = 4;
+    let isEraser = false;
+    
+    const colorInput = win.querySelector("#paint-color");
+    const sizeInput = win.querySelector("#paint-size");
+    const sizeLabel = win.querySelector("#paint-size-label");
+    const eraserBtn = win.querySelector("#paint-eraser");
+    const clearBtn = win.querySelector("#paint-clear");
+    const saveBtn = win.querySelector("#paint-save");
+    const swatches = win.querySelectorAll(".paint-swatch");
+
+    const updateActiveColor = (newColor) => {
+        color = newColor;
+        isEraser = false;
+        if (eraserBtn) eraserBtn.classList.remove("active");
+        if (colorInput) colorInput.value = newColor;
+        swatches.forEach(sw => {
+            if (sw.getAttribute("data-color").toLowerCase() === newColor.toLowerCase()) {
+                sw.classList.add("active");
+            } else {
+                sw.classList.remove("active");
+            }
+        });
+    };
+    
+    if (colorInput) {
+        colorInput.addEventListener("input", (e) => {
+            updateActiveColor(e.target.value);
+        });
+    }
+
+    swatches.forEach(sw => {
+        sw.addEventListener("click", () => {
+            updateActiveColor(sw.getAttribute("data-color"));
+        });
+    });
+    
+    if (sizeInput) {
+        sizeInput.addEventListener("input", (e) => {
+            size = parseInt(e.target.value, 10) || 4;
+            if (sizeLabel) sizeLabel.textContent = `${size}px`;
+        });
+    }
+
+    if (eraserBtn) {
+        eraserBtn.addEventListener("click", () => {
+            isEraser = !isEraser;
+            eraserBtn.classList.toggle("active", isEraser);
+            if (isEraser) {
+                swatches.forEach(sw => sw.classList.remove("active"));
+            } else {
+                updateActiveColor(color);
+            }
+        });
+    }
+
+    if (clearBtn) {
+        clearBtn.addEventListener("click", () => {
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            showToast("Canvas cleared");
+        });
+    }
+
+    if (saveBtn) {
+        saveBtn.addEventListener("click", () => {
+            const dataUrl = canvas.toDataURL("image/png");
+            const link = document.createElement("a");
+            link.download = `paint-artwork-${Date.now().toString().slice(-4)}.png`;
+            link.href = dataUrl;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            showToast("🎨 Drawing downloaded successfully!");
+        });
+    }
+    
+    const getPos = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+        const clientY = e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+            x: (clientX - rect.left) * scaleX,
+            y: (clientY - rect.top) * scaleY
+        };
+    };
+    
+    const startDraw = (e) => {
+        drawing = true;
+        const pos = getPos(e);
+        ctx.beginPath();
+        ctx.moveTo(pos.x, pos.y);
+    };
+
+    const moveDraw = (e) => {
+        if (!drawing) return;
+        const pos = getPos(e);
+        ctx.strokeStyle = isEraser ? "#ffffff" : color;
+        ctx.lineWidth = size;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.lineTo(pos.x, pos.y);
+        ctx.stroke();
+    };
+
+    const stopDraw = () => {
+        drawing = false;
+    };
+    
+    canvas.addEventListener("mousedown", startDraw);
+    canvas.addEventListener("mousemove", moveDraw);
+    canvas.addEventListener("mouseup", stopDraw);
+    canvas.addEventListener("mouseleave", stopDraw);
+
+    // Touch events for tablet/mobile
+    canvas.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        startDraw(e);
+    }, { passive: false });
+
+    canvas.addEventListener("touchmove", (e) => {
+        e.preventDefault();
+        moveDraw(e);
+    }, { passive: false });
+
+    canvas.addEventListener("touchend", stopDraw);
+    canvas.addEventListener("touchcancel", stopDraw);
+}
+
+export function openTerminal() {
+    const winId = "win-terminal";
+    const termIcon = `<iconify-icon icon="fluent:window-console-20-filled" width="18" height="18" style="color: #2ed573"></iconify-icon>`;
+    const bodyHTML = `
+        <div class="term-container">
+            <div class="term-output" id="term-output">SPIKETONES007 OS [Version 10.0.22621]
+(c) 2026 SPIKETONES Corporation. All rights reserved.
+
+Type 'help' for a list of available commands.
+</div>
+            <div class="term-input-row">
+                <span class="term-prompt">C:\\Users\\SPIKETONES&gt;</span>
+                <input type="text" class="term-input" id="term-input" autofocus spellcheck="false" autocomplete="off" />
+            </div>
+        </div>
+    `;
+    const win = openWindow("Terminal", bodyHTML, termIcon, winId, "term-window");
+    
+    const input = win.querySelector("#term-input");
+    const output = win.querySelector("#term-output");
+    
+    if (input && output) {
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                const cmd = input.value.trim();
+                input.value = "";
+                output.textContent += `C:\\Users\\SPIKETONES> ${cmd}\n`;
+                
+                const parts = cmd.split(" ");
+                const base = parts[0].toLowerCase();
+                const arg = parts.slice(1).join(" ");
+                
+                const modifyingCommands = ["mkdir", "touch", "rm", "del", "rmdir"];
+                if (modifyingCommands.includes(base) && currentUser !== "admin") {
+                    output.textContent += `Access Denied: Administrator privileges (SPIKETONES007) required for '${base}'.\nGuest mode is strictly read-only.\n\n`;
+                    const cont = win.querySelector(".term-container");
+                    if (cont) cont.scrollTop = cont.scrollHeight;
+                    return;
+                }
+
+                if (base === "help") {
+                    output.textContent += `Available commands:\n  help        - List commands\n  ls / dir    - List desktop items\n  cat <file>  - View file content\n  mkdir <dir> - Create folder (Admin only)\n  touch <file>- Create file (Admin only)\n  rm <item>   - Remove item (Admin only)\n  whoami      - Current user identity\n  date        - Current system timestamp\n  clear / cls - Clear terminal output\n  neofetch    - Show system specs\n  exit        - Close terminal\n\n`;
+                } else if (base === "ls" || base === "dir") {
+                    const names = currentDesktopData.map(d => `[${d.type.toUpperCase()}] ${d.name}`).join("\n");
+                    output.textContent += `${names}\n\n`;
+                } else if (base === "whoami") {
+                    output.textContent += `User: ${currentUser === "admin" ? "SPIKETONES007" : "Guest"} | Mode: ${currentUser === "admin" ? "Full Administrator" : "Read-Only Visitor"}\n\n`;
+                } else if (base === "date") {
+                    output.textContent += `${new Date().toString()}\n\n`;
+                } else if (base === "clear" || base === "cls") {
+                    output.textContent = "";
+                } else if (base === "neofetch") {
+                    output.textContent += `
+      ___          OS: SPIKETONES007 OS x86_64
+     /   \\         Host: WebBrowser Container
+    / /| |         Kernel: 6.8.0-virtual
+   / / | |         Uptime: 2 days, 4 hours
+  /_/  |_|         Shell: spike-sh 2.1
+                   Resolution: 1920x1080
+                   WM: Fluent Mica Acrylic
+                   Terminal: Spiketerm 1.0
+                   CPU: Virtual Octa-Core @ 3.4GHz
+                   Memory: 2048MB / 8192MB
+\n`;
+                } else if (base === "cat") {
+                    if (!arg) {
+                        output.textContent += "Usage: cat <filename>\n\n";
+                    } else {
+                        const content = localStorage.getItem(`file_${arg}`) || fileContentMap[arg] || "File not found.";
+                        output.textContent += `${content}\n\n`;
+                    }
+                } else if (base === "mkdir") {
+                    if (!arg) {
+                        output.textContent += "Usage: mkdir <folder_name>\n\n";
+                    } else {
+                        currentDesktopData.push({ name: arg, type: "folder", content: [] });
+                        saveDesktopData(currentDesktopData);
+                        renderDesktop();
+                        output.textContent += `Created folder '${arg}' on desktop.\n\n`;
+                    }
+                } else if (base === "touch") {
+                    if (!arg) {
+                        output.textContent += "Usage: touch <filename>\n\n";
+                    } else {
+                        currentDesktopData.push({ name: arg, type: "file" });
+                        fileContentMap[arg] = "";
+                        saveDesktopData(currentDesktopData);
+                        renderDesktop();
+                        output.textContent += `Created file '${arg}' on desktop.\n\n`;
+                    }
+                } else if (base === "rm" || base === "del") {
+                    if (!arg) {
+                        output.textContent += "Usage: rm <item_name>\n\n";
+                    } else {
+                        const idx = currentDesktopData.findIndex(d => d.name.toLowerCase() === arg.toLowerCase());
+                        if (idx !== -1) {
+                            const [removed] = currentDesktopData.splice(idx, 1);
+                            saveDesktopData(currentDesktopData);
+                            renderDesktop();
+                            output.textContent += `Removed '${removed.name}' from desktop.\n\n`;
+                        } else {
+                            output.textContent += `Item '${arg}' not found on desktop.\n\n`;
+                        }
+                    }
+                } else if (base === "exit") {
+                    win.remove();
+                    activeWindows = activeWindows.filter(w => w.id !== winId);
+                    updateTaskbar();
+                    return;
+                } else if (cmd) {
+                    output.textContent += `'${cmd}' is not recognized as an internal or external command.\n\n`;
+                }
+                
+                const cont = win.querySelector(".term-container");
+                if (cont) cont.scrollTop = cont.scrollHeight;
+            }
+        });
+    }
+}
+
+export function openSnake() {
+    const winId = "win-snake";
+    const snakeIcon = `<iconify-icon icon="fluent:games-24-filled" width="18" height="18" style="color: #ffa502"></iconify-icon>`;
+    const bodyHTML = `
+        <div class="snake-container">
+            <div class="snake-header">
+                <div>Score: <span id="snake-score" style="color:#ff8c00; font-weight:bold;">0</span></div>
+                <button class="folder-action-btn primary" id="snake-start-btn">Start Game</button>
+            </div>
+            <canvas class="snake-canvas" id="snake-canvas" width="340" height="340"></canvas>
+            <div style="font-size:11px; color:rgba(255,255,255,0.45); text-align:center;">
+                Use Arrow Keys or W A S D to control snake
+            </div>
+        </div>
+    `;
+    const win = openWindow("Snake Game", bodyHTML, snakeIcon, winId, "snake-window");
+    
+    const canvas = win.querySelector("#snake-canvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const scoreEl = win.querySelector("#snake-score");
+    const startBtn = win.querySelector("#snake-start-btn");
+    
+    const grid = 17;
+    let snake = [{ x: 8 * grid, y: 8 * grid }];
+    let dx = grid;
+    let dy = 0;
+    let food = { x: 4 * grid, y: 4 * grid };
+    let score = 0;
+    let gameLoop = null;
+    
+    function resetGame() {
+        snake = [{ x: 8 * grid, y: 8 * grid }];
+        dx = grid;
+        dy = 0;
+        score = 0;
+        if (scoreEl) scoreEl.textContent = "0";
+        spawnFood();
+    }
+    
+    function spawnFood() {
+        food = {
+            x: Math.floor(Math.random() * (canvas.width / grid)) * grid,
+            y: Math.floor(Math.random() * (canvas.height / grid)) * grid
+        };
+    }
+    
+    function update() {
+        const head = { x: snake[0].x + dx, y: snake[0].y + dy };
+        
+        // Wall collision wrap
+        if (head.x < 0) head.x = canvas.width - grid;
+        else if (head.x >= canvas.width) head.x = 0;
+        if (head.y < 0) head.y = canvas.height - grid;
+        else if (head.y >= canvas.height) head.y = 0;
+        
+        // Self collision
+        for (let i = 1; i < snake.length; i++) {
+            if (head.x === snake[i].x && head.y === snake[i].y) {
+                clearInterval(gameLoop);
+                gameLoop = null;
+                if (startBtn) startBtn.textContent = "Game Over - Restart";
+                return;
+            }
+        }
+        
+        snake.unshift(head);
+        
+        // Eat food
+        if (head.x === food.x && head.y === food.y) {
+            score += 10;
+            if (scoreEl) scoreEl.textContent = score;
+            spawnFood();
+        } else {
+            snake.pop();
+        }
+        
+        // Draw
+        ctx.fillStyle = "#0c0b0a";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // Food
+        ctx.fillStyle = "#ff4757";
+        ctx.fillRect(food.x + 2, food.y + 2, grid - 4, grid - 4);
+        
+        // Snake
+        snake.forEach((part, index) => {
+            ctx.fillStyle = index === 0 ? "#ffa502" : "#2ed573";
+            ctx.fillRect(part.x + 1, part.y + 1, grid - 2, grid - 2);
+        });
+    }
+    
+    if (startBtn) {
+        startBtn.addEventListener("click", () => {
+            if (gameLoop) clearInterval(gameLoop);
+            resetGame();
+            startBtn.textContent = "Playing...";
+            gameLoop = setInterval(update, 110);
+        });
+    }
+    
+    const onKey = (e) => {
+        if (!win.isConnected) {
+            document.removeEventListener("keydown", onKey);
+            if (gameLoop) clearInterval(gameLoop);
+            return;
+        }
+        if ((e.key === "ArrowUp" || e.key === "w" || e.key === "W") && dy === 0) {
+            dx = 0; dy = -grid; e.preventDefault();
+        } else if ((e.key === "ArrowDown" || e.key === "s" || e.key === "S") && dy === 0) {
+            dx = 0; dy = grid; e.preventDefault();
+        } else if ((e.key === "ArrowLeft" || e.key === "a" || e.key === "A") && dx === 0) {
+            dx = -grid; dy = 0; e.preventDefault();
+        } else if ((e.key === "ArrowRight" || e.key === "d" || e.key === "D") && dx === 0) {
+            dx = grid; dy = 0; e.preventDefault();
+        }
+    };
+    document.addEventListener("keydown", onKey);
+    
+    // Draw initial board
+    ctx.fillStyle = "#0c0b0a";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#ffa502";
+    ctx.fillRect(8 * grid, 8 * grid, grid - 2, grid - 2);
+}
+
+// --- Guestbook (Regular Visitor) ---
+function formatGuestbookDate(msg) {
+    if (typeof msg === 'object' && msg.date_label) return msg.date_label;
+    const iso = typeof msg === 'object' ? msg.created_at : msg;
+    try {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return "Recent";
+        const month = d.toLocaleString("en-US", { month: "short" });
+        const day = d.getDate();
+        let hours = d.getHours();
+        const minutes = String(d.getMinutes()).padStart(2, "0");
+        const ampm = hours >= 12 ? "PM" : "AM";
+        hours = hours % 12 || 12;
+        const hoursStr = hours < 10 ? `0${hours}` : `${hours}`;
+        return `${month} ${day}, ${hoursStr}:${minutes} ${ampm}`;
+    } catch (e) {
+        return "Recent";
+    }
+}
+
+export function openGuestbook() {
+    const winId = "win-guestbook";
+    const existing = document.getElementById(winId);
+    if (existing) {
+        existing.classList.remove("minimized");
+        bringToFront(existing);
+        updateTaskbar();
+        return;
+    }
+
+    const gbIcon = `<svg width="19" height="19" viewBox="0 0 24 24" fill="#c85627" style="display:inline-block; vertical-align:middle; flex-shrink: 0;"><path d="M4 3h16a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7.5l-4.2 3.8A1 1 0 0 1 1.6 22V6a3 3 0 0 1 3-3zm3 5a1 1 0 0 0 0 2h10a1 1 0 1 0 0-2H7zm0 4a1 1 0 0 0 0 2h6a1 1 0 1 0 0-2H7z"/></svg>`;
+    const contentHTML = `
+        <div class="guestbook-container">
+            <div class="guestbook-messages" id="gb-messages-list">
+                <div style="font-size: 12px; color: rgba(255,255,255,0.4); text-align: center; padding: 16px;">Loading notes...</div>
+            </div>
+            <form class="guestbook-form" id="guestbook-form">
+                <div class="guestbook-input-row">
+                    <input type="text" id="gb-author-input" class="guestbook-input name" placeholder="Name" maxlength="20" autocomplete="off" />
+                    <input type="text" id="gb-msg-input" class="guestbook-input message" placeholder="Leave a note..." maxlength="150" autocomplete="off" required />
+                    <button type="submit" id="gb-post-btn" class="guestbook-btn">Post</button>
+                </div>
+            </form>
+        </div>
+    `;
+
+    openWindow("Guestbook", contentHTML, gbIcon, winId, "guestbook-panel");
+
+    const renderMessages = (messages) => {
+        activeGuestbookRender = renderMessages;
+        const list = document.getElementById("gb-messages-list");
+        if (!list) return;
+        list.innerHTML = "";
+        messages.forEach((msg) => {
+            const card = document.createElement("div");
+            card.className = "guestbook-message";
+            card.setAttribute("data-id", msg.id || "");
+
+            let deleteBtnHTML = "";
+            if (currentUser === "admin" && msg.id) {
+                deleteBtnHTML = `<button class="gb-delete-btn" data-id="${msg.id}" title="Delete comment as Admin">✕</button>`;
+            }
+
+            card.innerHTML = `
+                <div class="guestbook-meta">
+                    <div class="guestbook-meta-left">
+                        <span class="guestbook-author">${escapeHTML(msg.author || 'Anonymous')}</span>
+                        <span class="guestbook-date">${formatGuestbookDate(msg)}</span>
+                    </div>
+                    ${deleteBtnHTML}
+                </div>
+                <div class="guestbook-text">${escapeHTML(msg.message || '')}</div>
+            `;
+
+            if (currentUser === "admin" && msg.id) {
+                const delBtn = card.querySelector(".gb-delete-btn");
+                if (delBtn) {
+                    delBtn.addEventListener("click", async (e) => {
+                        e.stopPropagation();
+                        if (currentUser !== "admin") return;
+                        if (confirm("Delete this guestbook comment?")) {
+                            await deleteGuestbookMessage(msg.id);
+                            showToast("Comment deleted");
+                            const updated = await fetchGuestbook();
+                            renderMessages(updated);
+                        }
+                    });
+                }
+            }
+
+            list.appendChild(card);
+        });
+        list.scrollTop = list.scrollHeight;
+    };
+
+    // Initial fetch from Firestore (or localStorage fallback)
+    fetchGuestbook().then(renderMessages);
+
+    // Live subscription for incoming messages
+    subscribeGuestbook((newMsg) => {
+        const list = document.getElementById("gb-messages-list");
+        if (!list) return;
+        
+        // Prevent duplicate rendering
+        const existingCard = list.querySelector(`[data-id="${newMsg.id}"]`);
+        if (existingCard) return;
+
+        const card = document.createElement("div");
+        card.className = "guestbook-message";
+        card.setAttribute("data-id", newMsg.id || "");
+
+        let deleteBtnHTML = "";
+        if (currentUser === "admin" && newMsg.id) {
+            deleteBtnHTML = `<button class="gb-delete-btn" data-id="${newMsg.id}" title="Delete comment as Admin">✕</button>`;
+        }
+
+        card.innerHTML = `
+            <div class="guestbook-meta">
+                <span class="guestbook-author">${escapeHTML(newMsg.author || 'Anonymous')}</span>
+                <span class="guestbook-date">${formatGuestbookDate(newMsg)}</span>
+                ${deleteBtnHTML}
+            </div>
+            <div class="guestbook-text">${escapeHTML(newMsg.message || '')}</div>
+        `;
+
+        if (currentUser === "admin" && newMsg.id) {
+            const delBtn = card.querySelector(".gb-delete-btn");
+            if (delBtn) {
+                delBtn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    if (confirm("Delete this guestbook comment?")) {
+                        await deleteGuestbookMessage(newMsg.id);
+                        showToast("Comment deleted");
+                        const updated = await fetchGuestbook();
+                        renderMessages(updated);
+                    }
+                });
+            }
+        }
+
+        list.appendChild(card);
+        list.scrollTop = list.scrollHeight;
+    });
+
+    const form = document.getElementById("guestbook-form");
+    if (form) {
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const authorInput = document.getElementById("gb-author-input");
+            const msgInput = document.getElementById("gb-msg-input");
+            const postBtn = document.getElementById("gb-post-btn");
+            if (!msgInput || !msgInput.value.trim()) return;
+
+            const author = (authorInput && authorInput.value.trim()) || "Anonymous";
+            const text = msgInput.value.trim();
+
+            postBtn.disabled = true;
+            postBtn.textContent = "...";
+
+            const saved = await insertGuestbook(author, text);
+            if (saved) {
+                msgInput.value = "";
+                const messages = await fetchGuestbook();
+                renderMessages(messages);
+            }
+            postBtn.disabled = false;
+            postBtn.textContent = "Post";
+        });
+    }
+}
+
+// --- ADMIN EDIT MODE ---
+export function openAdminEditMode() {
+    isOwner = true;
+    const winId = "win-owner-edit";
+    const existing = document.getElementById(winId);
+    if (existing) {
+        existing.classList.remove("minimized");
+        bringToFront(existing);
+        updateTaskbar();
+        return;
+    }
+
+    const isConnected = isFirebaseConfigured();
+    const statusText = isConnected ? "Firebase Firestore: Online (spiketones7)" : "Offline Mode (localStorage Backup)";
+    const dotClass = isConnected ? "" : "offline";
+
+    const contentHTML = `
+        <div class="owner-container">
+            <div class="owner-tabs">
+                <button class="owner-tab-btn active" data-tab="tab-wallpaper">🖼️ Wallpaper</button>
+                <button class="owner-tab-btn" data-tab="tab-desktop">🖥️ Desktop Layout</button>
+                <button class="owner-tab-btn" data-tab="tab-music">🎵 Music Library</button>
+            </div>
+
+            <!-- Tab 1: Wallpaper -->
+            <div class="owner-tab-content active" id="tab-wallpaper">
+                <div class="owner-section-title">Change Wallpaper</div>
+                <div class="owner-subtext">Upload a new background image or enter a URL. Synced to all visitors via Firebase Firestore.</div>
+                
+                <div class="owner-field">
+                    <label class="owner-label">Preview</label>
+                    <div class="owner-preview-box" id="owner-wp-preview" style="background-image: url('${currentWallpaper}')" title="Wallpaper preview (Drag and drop an image here to apply)"></div>
+                </div>
+
+                <div class="owner-field">
+                    <div class="owner-upload-area" id="owner-wp-upload-dropzone">
+                        <iconify-icon icon="fluent:arrow-upload-24-filled" width="22" height="22" style="color: #ff8c00;"></iconify-icon>
+                        <div style="flex: 1;">
+                            <div style="font-size: 13px; font-weight: 500; color: #ffffff;">Upload Wallpaper from Device</div>
+                            <div style="font-size: 11px; color: rgba(255, 255, 255, 0.55);">Click to browse or drop an image file (PNG, JPG, WEBP)</div>
+                        </div>
+                        <button type="button" class="owner-btn-mini" id="owner-wp-browse-btn" style="padding: 4px 12px; height: 32px; background: rgba(255, 140, 0, 0.25); border: 1px solid #ff8c00; color: #ffffff; border-radius: 4px;">Upload Image</button>
+                    </div>
+                </div>
+
+                <div class="owner-field">
+                    <label class="owner-label">Or Wallpaper Image URL</label>
+                    <input type="text" id="owner-wp-input" class="owner-input" value="${currentWallpaper}" placeholder="wall.png or https://example.com/image.jpg" />
+                </div>
+
+                <div style="display: flex; gap: 8px;">
+                    <button class="owner-save-btn" id="owner-wp-save" style="flex: 1;">Save Wallpaper</button>
+                    <button class="owner-btn-mini" id="owner-wp-reset" style="width: auto; padding: 0 12px; height: 40px;" title="Reset to default">Default</button>
+                </div>
+            </div>
+
+            <!-- Tab 2: Desktop Layout -->
+            <div class="owner-tab-content" id="tab-desktop">
+                <div class="owner-section-title">
+                    <span>Desktop Icons</span>
+                    <button class="owner-save-btn" id="owner-dt-save" style="height: 30px; font-size: 11.5px; padding: 0 12px;">Save Layout</button>
+                </div>
+                <div class="owner-subtext">Reorder, modify, add, or delete desktop items. Saved to Firebase Firestore.</div>
+
+                <div class="owner-list" id="owner-dt-list"></div>
+
+                <div class="owner-section-title" style="margin-top: 8px;">Add New Desktop Item</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                    <div class="owner-field">
+                        <label class="owner-label">Item Name</label>
+                        <input type="text" id="new-item-name" class="owner-input" placeholder="e.g. My Website" />
+                    </div>
+                    <div class="owner-field">
+                        <label class="owner-label">Type</label>
+                        <select id="new-item-type" class="owner-input" style="background: rgba(0,0,0,0.65);">
+                            <option value="link">Link (Web URL)</option>
+                            <option value="file">File (Notepad)</option>
+                            <option value="folder">Folder</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="owner-field">
+                    <label class="owner-label">URL or Destination (if link)</label>
+                    <input type="text" id="new-item-url" class="owner-input" placeholder="https://example.com" />
+                </div>
+                <button class="owner-save-btn" id="new-item-add" style="background: #444; height: 36px;">+ Add Item to Desktop</button>
+            </div>
+
+            <!-- Tab 3: Music Library -->
+            <div class="owner-tab-content" id="tab-music">
+                <div class="owner-section-title">
+                    <span>Music Player Library</span>
+                    <button class="owner-save-btn" id="owner-ml-save" style="height: 30px; font-size: 11.5px; padding: 0 12px;">Save Music Library</button>
+                </div>
+                <div class="owner-subtext">Add or remove songs playable in the HDD mini-player. Saved to Firebase Firestore.</div>
+
+                <div class="owner-list" id="owner-ml-list"></div>
+
+                <div class="owner-section-title" style="margin-top: 8px;">Add New Song</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                    <div class="owner-field">
+                        <label class="owner-label">Song Title</label>
+                        <input type="text" id="new-song-title" class="owner-input" placeholder="e.g. Stop Breathing" />
+                    </div>
+                    <div class="owner-field">
+                        <label class="owner-label">Artist</label>
+                        <input type="text" id="new-song-artist" class="owner-input" placeholder="e.g. Playboi Carti" />
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                    <div class="owner-field">
+                        <label class="owner-label">Audio URL / Path</label>
+                        <input type="text" id="new-song-src" class="owner-input" placeholder="files/music/song1.mp3 or web mp3" />
+                    </div>
+                    <div class="owner-field">
+                        <label class="owner-label">Cover Image URL</label>
+                        <input type="text" id="new-song-cover" class="owner-input" placeholder="files/cover/song1.jpg" />
+                    </div>
+                </div>
+                <button class="owner-save-btn" id="new-song-add" style="background: #444; height: 36px;">+ Add Track to Library</button>
+            </div>
+
+            <!-- Status Footer -->
+            <div class="owner-footer-status">
+                <span class="owner-status-badge">
+                    <span class="owner-status-dot ${dotClass}"></span>
+                    <span id="owner-db-status">${statusText}</span>
+                </span>
+                <span>Press <code>Esc</code> or <code>✕</code> to close</span>
+            </div>
+        </div>
+    `;
+
+    const adminIcon = `<iconify-icon icon="fluent:settings-24-filled" width="18" height="18" style="color: #ff8c00"></iconify-icon>`;
+    const win = openWindow("Admin Settings — Desktop & Wallpaper", contentHTML, adminIcon, winId, "owner-panel");
+
+    // Tab switching
+    const tabBtns = win.querySelectorAll(".owner-tab-btn");
+    const tabContents = win.querySelectorAll(".owner-tab-content");
+    tabBtns.forEach(btn => {
+        btn.addEventListener("click", () => {
+            tabBtns.forEach(b => b.classList.remove("active"));
+            tabContents.forEach(c => c.classList.remove("active"));
+            btn.classList.add("active");
+            const target = win.querySelector(`#${btn.getAttribute("data-tab")}`);
+            if (target) target.classList.add("active");
+        });
+    });
+
+    // --- Wallpaper Logic ---
+    const wpInput = win.querySelector("#owner-wp-input");
+    const wpPreview = win.querySelector("#owner-wp-preview");
+    const wpSaveBtn = win.querySelector("#owner-wp-save");
+    const wpResetBtn = win.querySelector("#owner-wp-reset");
+    const wpDropzone = win.querySelector("#owner-wp-upload-dropzone");
+    const wpBrowseBtn = win.querySelector("#owner-wp-browse-btn");
+    const adminWpUploader = document.getElementById("admin-wallpaper-uploader");
+
+    const processWallpaperFile = (file) => {
+        if (!file || !file.type.startsWith("image/")) {
+            showToast("Please select a valid image file.");
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+            const dataUrl = ev.target.result;
+            if (wpPreview) wpPreview.style.backgroundImage = `url('${dataUrl}')`;
+            if (wpInput) {
+                wpInput.value = `[Uploaded: ${file.name}]`;
+                wpInput.dataset.fullUrl = dataUrl;
+            }
+            setWallpaper(dataUrl);
+            showToast(`Wallpaper uploaded and applied: "${file.name}"!`);
+        };
+        reader.readAsDataURL(file);
+    };
+
+    if (wpBrowseBtn) {
+        wpBrowseBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (adminWpUploader) adminWpUploader.click();
+        });
+    }
+
+    if (wpDropzone) {
+        wpDropzone.addEventListener("click", () => {
+            if (adminWpUploader) adminWpUploader.click();
+        });
+        wpDropzone.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            wpDropzone.classList.add("drag-over");
+        });
+        wpDropzone.addEventListener("dragleave", () => {
+            wpDropzone.classList.remove("drag-over");
+        });
+        wpDropzone.addEventListener("drop", (e) => {
+            e.preventDefault();
+            wpDropzone.classList.remove("drag-over");
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+                processWallpaperFile(e.dataTransfer.files[0]);
+            }
+        });
+    }
+
+    if (wpPreview) {
+        wpPreview.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            wpPreview.classList.add("drag-over");
+        });
+        wpPreview.addEventListener("dragleave", () => {
+            wpPreview.classList.remove("drag-over");
+        });
+        wpPreview.addEventListener("drop", (e) => {
+            e.preventDefault();
+            wpPreview.classList.remove("drag-over");
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+                processWallpaperFile(e.dataTransfer.files[0]);
+            }
+        });
+    }
+
+    if (adminWpUploader) {
+        adminWpUploader.onchange = () => {
+            if (adminWpUploader.files && adminWpUploader.files[0]) {
+                processWallpaperFile(adminWpUploader.files[0]);
+                adminWpUploader.value = "";
+            }
+        };
+    }
+
+    if (wpInput) {
+        wpInput.addEventListener("input", () => {
+            delete wpInput.dataset.fullUrl;
+            if (wpPreview) wpPreview.style.backgroundImage = `url('${wpInput.value.trim()}')`;
+        });
+    }
+
+    if (wpResetBtn) {
+        wpResetBtn.addEventListener("click", () => {
+            if (wpInput) {
+                wpInput.value = "wall.png";
+                delete wpInput.dataset.fullUrl;
+            }
+            if (wpPreview) wpPreview.style.backgroundImage = "url('wall.png')";
+            setWallpaper("wall.png");
+            showToast("Wallpaper reset to default.");
+        });
+    }
+
+    if (wpSaveBtn) {
+        wpSaveBtn.addEventListener("click", async () => {
+            const url = (wpInput && wpInput.dataset.fullUrl) ? wpInput.dataset.fullUrl : (wpInput ? wpInput.value.trim() : "");
+            if (!url) return;
+            wpSaveBtn.textContent = "Saving...";
+            wpSaveBtn.disabled = true;
+
+            const res = await saveWallpaper(url);
+            setWallpaper(url);
+            
+            wpSaveBtn.textContent = "Save Wallpaper";
+            wpSaveBtn.disabled = false;
+            showToast(res.firestore ? "Wallpaper saved to Firebase Firestore!" : "Wallpaper saved to localStorage!");
+        });
+    }
+
+    // --- Desktop Layout Logic ---
+    const dtList = win.querySelector("#owner-dt-list");
+    const dtSaveBtn = win.querySelector("#owner-dt-save");
+    const addItemBtn = win.querySelector("#new-item-add");
+
+    const renderDtList = () => {
+        if (!dtList) return;
+        dtList.innerHTML = "";
+        currentDesktopData.forEach((item, idx) => {
+            const row = document.createElement("div");
+            row.className = "owner-list-item";
+            row.innerHTML = `
+                <div class="owner-item-info">
+                    <span style="font-size: 16px;">${item.type === 'folder' ? '📁' : item.type === 'link' ? '🔗' : '📄'}</span>
+                    <div>
+                        <div class="owner-item-name">${escapeHTML(item.name)}</div>
+                        <div class="owner-item-detail">${escapeHTML(item.type)}${item.url ? ' • ' + escapeHTML(item.url) : ''}</div>
+                    </div>
+                </div>
+                <div class="owner-item-actions">
+                    <button class="owner-btn-mini move-up" data-idx="${idx}" title="Move Up">▲</button>
+                    <button class="owner-btn-mini move-down" data-idx="${idx}" title="Move Down">▼</button>
+                    <button class="owner-btn-mini danger delete-item" data-idx="${idx}" title="Delete">✕</button>
+                </div>
+            `;
+            dtList.appendChild(row);
+        });
+
+        // Event listeners for move / delete
+        dtList.querySelectorAll(".move-up").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                if (idx > 0) {
+                    const temp = currentDesktopData[idx];
+                    currentDesktopData[idx] = currentDesktopData[idx - 1];
+                    currentDesktopData[idx - 1] = temp;
+                    renderDtList();
+                    renderDesktop();
+                }
+            });
+        });
+
+        dtList.querySelectorAll(".move-down").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                if (idx < currentDesktopData.length - 1) {
+                    const temp = currentDesktopData[idx];
+                    currentDesktopData[idx] = currentDesktopData[idx + 1];
+                    currentDesktopData[idx + 1] = temp;
+                    renderDtList();
+                    renderDesktop();
+                }
+            });
+        });
+
+        dtList.querySelectorAll(".delete-item").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                currentDesktopData.splice(idx, 1);
+                renderDtList();
+                renderDesktop();
+            });
+        });
+    };
+
+    renderDtList();
+
+    if (addItemBtn) {
+        addItemBtn.addEventListener("click", () => {
+            const nameInput = win.querySelector("#new-item-name");
+            const typeInput = win.querySelector("#new-item-type");
+            const urlInput = win.querySelector("#new-item-url");
+            const name = nameInput.value.trim();
+            if (!name) return;
+
+            const newItem = {
+                name,
+                type: typeInput.value,
+            };
+            if (newItem.type === 'link') {
+                newItem.url = urlInput.value.trim() || 'https://google.com';
+                newItem.customIcon = 'fluent:link-24-filled';
+            } else if (newItem.type === 'folder') {
+                newItem.content = [];
+            }
+
+            currentDesktopData.push(newItem);
+            nameInput.value = "";
+            urlInput.value = "";
+            renderDtList();
+            renderDesktop();
+        });
+    }
+
+    if (dtSaveBtn) {
+        dtSaveBtn.addEventListener("click", async () => {
+            dtSaveBtn.textContent = "Saving...";
+            dtSaveBtn.disabled = true;
+
+            const res = await saveDesktopData(currentDesktopData);
+            renderDesktop();
+
+            dtSaveBtn.textContent = "Save Layout";
+            dtSaveBtn.disabled = false;
+            showToast(res.firestore ? "Desktop layout saved to Firebase Firestore!" : "Desktop layout saved to localStorage!");
+        });
+    }
+
+    // --- Music Library Logic ---
+    const mlList = win.querySelector("#owner-ml-list");
+    const mlSaveBtn = win.querySelector("#owner-ml-save");
+    const addSongBtn = win.querySelector("#new-song-add");
+
+    const renderMlList = () => {
+        if (!mlList) return;
+        mlList.innerHTML = "";
+        currentMusicLibrary.forEach((song, idx) => {
+            const row = document.createElement("div");
+            row.className = "owner-list-item";
+            row.innerHTML = `
+                <div class="owner-item-info">
+                    <img src="${song.cover || 'files/cover/song1.jpg'}" style="width: 28px; height: 28px; border-radius: 4px; object-fit: cover;" onerror="this.src='files/cover/song1.jpg'" />
+                    <div>
+                        <div class="owner-item-name">${escapeHTML(song.title)}</div>
+                        <div class="owner-item-detail">${escapeHTML(song.artist || 'Unknown')} • ${escapeHTML(song.src)}</div>
+                    </div>
+                </div>
+                <div class="owner-item-actions">
+                    <button class="owner-btn-mini song-up" data-idx="${idx}" title="Move Up">▲</button>
+                    <button class="owner-btn-mini song-down" data-idx="${idx}" title="Move Down">▼</button>
+                    <button class="owner-btn-mini danger song-del" data-idx="${idx}" title="Delete">✕</button>
+                </div>
+            `;
+            mlList.appendChild(row);
+        });
+
+        mlList.querySelectorAll(".song-up").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                if (idx > 0) {
+                    const temp = currentMusicLibrary[idx];
+                    currentMusicLibrary[idx] = currentMusicLibrary[idx - 1];
+                    currentMusicLibrary[idx - 1] = temp;
+                    renderMlList();
+                    updateHDDUI();
+                }
+            });
+        });
+
+        mlList.querySelectorAll(".song-down").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                if (idx < currentMusicLibrary.length - 1) {
+                    const temp = currentMusicLibrary[idx];
+                    currentMusicLibrary[idx] = currentMusicLibrary[idx + 1];
+                    currentMusicLibrary[idx + 1] = temp;
+                    renderMlList();
+                    updateHDDUI();
+                }
+            });
+        });
+
+        mlList.querySelectorAll(".song-del").forEach(b => {
+            b.addEventListener("click", () => {
+                const idx = parseInt(b.getAttribute("data-idx"), 10);
+                if (currentMusicLibrary.length <= 1) {
+                    showToast("Music library must contain at least 1 track", false);
+                    return;
+                }
+                currentMusicLibrary.splice(idx, 1);
+                if (currentTrackIndex >= currentMusicLibrary.length) currentTrackIndex = 0;
+                renderMlList();
+                updateHDDUI();
+            });
+        });
+    };
+
+    renderMlList();
+
+    if (addSongBtn) {
+        addSongBtn.addEventListener("click", () => {
+            const titleInput = win.querySelector("#new-song-title");
+            const artistInput = win.querySelector("#new-song-artist");
+            const srcInput = win.querySelector("#new-song-src");
+            const coverInput = win.querySelector("#new-song-cover");
+
+            const title = titleInput.value.trim();
+            const artist = artistInput.value.trim() || "Unknown Artist";
+            const src = srcInput.value.trim() || "files/music/song1.mp3";
+            const cover = coverInput.value.trim() || "files/cover/song1.jpg";
+
+            if (!title) return;
+
+            currentMusicLibrary.push({ title, artist, src, cover });
+            titleInput.value = "";
+            artistInput.value = "";
+            srcInput.value = "";
+            coverInput.value = "";
+
+            renderMlList();
+            updateHDDUI();
+        });
+    }
+
+    if (mlSaveBtn) {
+        mlSaveBtn.addEventListener("click", async () => {
+            mlSaveBtn.textContent = "Saving...";
+            mlSaveBtn.disabled = true;
+
+            const res = await saveMusicLibrary(currentMusicLibrary);
+            updateHDDUI();
+
+            mlSaveBtn.textContent = "Save Music Library";
+            mlSaveBtn.disabled = false;
+            showToast(res.firestore ? "Music library saved to Firebase Firestore!" : "Music library saved to localStorage!");
+        });
+    }
+}
+
+// --- Taskbar Management (Icons Only) ---
+function updateTaskbar() {
+    const container = document.getElementById("taskbar-apps");
+    if (!container) return;
+    container.innerHTML = "";
+
+    activeWindows.forEach(winObj => {
+        const btn = document.createElement("div");
+        btn.className = "taskbar-app";
+        btn.title = winObj.title;
+        btn.setAttribute("aria-label", winObj.title);
+        const domWin = document.getElementById(winObj.id);
+        if (domWin && !domWin.classList.contains("minimized")) {
+            btn.classList.add("active");
+        }
+
+        btn.innerHTML = winObj.iconHTML || '<iconify-icon icon="fluent:app-generic-24-filled" width="22" height="22"></iconify-icon>';
+        btn.addEventListener("click", () => {
+            if (!domWin) return;
+            if (domWin.classList.contains("minimized")) {
+                domWin.classList.remove("minimized");
+                bringToFront(domWin);
+            } else {
+                if (domWin.style.zIndex == zIndexCounter) {
+                    domWin.classList.add("minimized");
+                } else {
+                    bringToFront(domWin);
+                }
+            }
+            updateTaskbar();
+        });
+
+        container.appendChild(btn);
+    });
+}
+
+// --- HDD Mini Player ---
+function initHDDPlayer() {
+    const existing = document.getElementById("hdd-mini-player");
+    if (existing) return;
+
+    const track = currentMusicLibrary[currentTrackIndex] || currentMusicLibrary[0];
+    const playerDiv = document.createElement("div");
+    playerDiv.id = "hdd-mini-player";
+    playerDiv.innerHTML = `
+        <div class="hdd-base">
+            <img src="${track.cover}" class="hdd-platter" id="hdd-cover" alt="Cover" />
+        </div>
+        <div class="hdd-info" id="hdd-track-name">${escapeHTML(track.title)}</div>
+        <div class="hdd-controls">
+            <button class="hdd-btn" id="hdd-prev-btn" title="Previous">⏮</button>
+            <button class="hdd-btn" id="hdd-play-btn" title="Play">▶</button>
+            <button class="hdd-btn" id="hdd-next-btn" title="Next">⏭</button>
+        </div>
+    `;
+
+    document.getElementById("desktop").appendChild(playerDiv);
+
+    // Dragging support for HDD player
+    let isDragging = false;
+    let startX = 0, startY = 0, initLeft = 0, initTop = 0;
+
+    playerDiv.addEventListener("mousedown", (e) => {
+        if (e.target.closest(".hdd-controls")) return;
+        isDragging = true;
+        const rect = playerDiv.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        initLeft = rect.left;
+        initTop = rect.top;
+
+        const onMove = (ev) => {
+            if (!isDragging) return;
+            playerDiv.style.left = `${initLeft + (ev.clientX - startX)}px`;
+            playerDiv.style.top = `${initTop + (ev.clientY - startY)}px`;
+            playerDiv.style.right = "auto";
+        };
+
+        const onUp = () => {
+            isDragging = false;
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+        };
+
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+    });
+
+    document.getElementById("hdd-play-btn").addEventListener("click", togglePlay);
+    document.getElementById("hdd-prev-btn").addEventListener("click", prevTrack);
+    document.getElementById("hdd-next-btn").addEventListener("click", nextTrack);
+
+    audio.addEventListener("ended", nextTrack);
+}
+
+function updateHDDUI() {
+    const track = currentMusicLibrary[currentTrackIndex];
+    if (!track) return;
+    const cover = document.getElementById("hdd-cover");
+    const title = document.getElementById("hdd-track-name");
+    const playBtn = document.getElementById("hdd-play-btn");
+    const playerDiv = document.getElementById("hdd-mini-player");
+
+    if (cover) cover.src = track.cover;
+    if (title) title.textContent = track.title;
+    if (playBtn) playBtn.textContent = isPlaying ? "⏸" : "▶";
+    if (playerDiv) {
+        if (isPlaying) playerDiv.classList.add("playing");
+        else playerDiv.classList.remove("playing");
+    }
+}
+
+function togglePlay() {
+    const track = currentMusicLibrary[currentTrackIndex];
+    if (!track) return;
+
+    if (!audio.src || !audio.src.includes(track.src)) {
+        audio.src = track.src;
+    }
+
+    if (isPlaying) {
+        audio.pause();
+        isPlaying = false;
+    } else {
+        audio.play().catch(e => {
+            console.warn("Audio autoplay blocked or format error, simulated:", e);
+        });
+        isPlaying = true;
+    }
+    updateHDDUI();
+}
+
+function nextTrack() {
+    currentTrackIndex = (currentTrackIndex + 1) % currentMusicLibrary.length;
+    const track = currentMusicLibrary[currentTrackIndex];
+    audio.src = track.src;
+    if (isPlaying) audio.play().catch(() => {});
+    updateHDDUI();
+}
+
+function prevTrack() {
+    currentTrackIndex = (currentTrackIndex - 1 + currentMusicLibrary.length) % currentMusicLibrary.length;
+    const track = currentMusicLibrary[currentTrackIndex];
+    audio.src = track.src;
+    if (isPlaying) audio.play().catch(() => {});
+    updateHDDUI();
+}
+
+function playTrackBySrc(src, name) {
+    const idx = currentMusicLibrary.findIndex(m => m.src === src || m.title === name);
+    if (idx !== -1) {
+        currentTrackIndex = idx;
+        const track = currentMusicLibrary[currentTrackIndex];
+        audio.src = track.src;
+        audio.play().catch(() => {});
+        isPlaying = true;
+        updateHDDUI();
+    }
+}
+
+// --- Start Menu & User Switcher System ---
+export function toggleStartMenu(e) {
+    if (e) e.stopPropagation();
+    const menu = document.getElementById("start-menu");
+    if (!menu) return;
+    menu.classList.toggle("active");
+    if (menu.classList.contains("active")) {
+        renderStartMenuApps();
+    } else {
+        const popup = document.getElementById("user-switcher-popup");
+        if (popup) popup.classList.remove("visible");
+    }
+}
+
+export function toggleUserSwitcher(e) {
+    if (e) e.stopPropagation();
+    const popup = document.getElementById("user-switcher-popup");
+    if (!popup) return;
+    popup.classList.toggle("visible");
+}
+
+export function switchUser(userType) {
+    const popup = document.getElementById("user-switcher-popup");
+    if (popup) popup.classList.remove("visible");
+    const startMenu = document.getElementById("start-menu");
+    if (startMenu) startMenu.classList.remove("active");
+
+    if (userType === "admin") {
+        selectLockUser("admin");
+        lockSystem();
+        return;
+    }
+
+    // Switch to guest with Windows 11 Welcome screen
+    selectLockUser("guest");
+    lockSystem();
+}
+
+function updateUserUI() {
+    const avatarEl = document.getElementById("start-user-avatar");
+    const nameEl = document.getElementById("start-user-name");
+    const roleEl = document.getElementById("start-user-role");
+    const pillEl = document.getElementById("start-account-pill");
+    const optGuest = document.getElementById("user-opt-guest");
+    const optAdmin = document.getElementById("user-opt-admin");
+    const adminBar = document.getElementById("admin-quick-bar");
+
+    document.body.classList.toggle("user-admin", currentUser === "admin");
+
+    // Dynamic control updates across open windows
+    document.querySelectorAll(".win-btn.pin-btn").forEach(btn => {
+        btn.style.display = currentUser === "admin" ? "" : "none";
+    });
+
+    document.querySelectorAll(".notepad-btn").forEach(btn => {
+        btn.style.display = currentUser === "admin" ? "" : "none";
+    });
+
+    document.querySelectorAll(".notepad-textarea").forEach(ta => {
+        ta.readOnly = (currentUser !== "admin");
+    });
+
+    const fbWidget = document.getElementById("firebase-status-widget");
+    if (fbWidget) {
+        fbWidget.style.display = currentUser === "admin" ? "inline-flex" : "none";
+    }
+
+    if (activeGuestbookRender) {
+        fetchGuestbook().then(activeGuestbookRender);
+    }
+
+    if (currentUser === "admin") {
+        isOwner = true;
+        if (avatarEl) {
+            avatarEl.textContent = "S";
+            avatarEl.className = "start-user-avatar admin";
+        }
+        if (nameEl) nameEl.textContent = "SPIKETONES007";
+        if (roleEl) {
+            roleEl.textContent = "Admin";
+            roleEl.className = "start-user-role admin";
+        }
+        if (pillEl) {
+            pillEl.textContent = "Admin Mode";
+            pillEl.className = "start-account-pill admin";
+        }
+        if (optGuest) optGuest.classList.remove("active");
+        if (optAdmin) optAdmin.classList.add("active");
+        if (adminBar) adminBar.style.display = "block";
+        const stickyContainer = document.getElementById("sticky-notes-container");
+        if (stickyContainer) stickyContainer.style.display = "block";
+    } else {
+        isOwner = false;
+        if (avatarEl) {
+            avatarEl.textContent = "👤";
+            avatarEl.className = "start-user-avatar guest";
+        }
+        if (nameEl) nameEl.textContent = "Guest";
+        if (roleEl) {
+            roleEl.textContent = "Visitor";
+            roleEl.className = "start-user-role";
+        }
+        if (pillEl) {
+            pillEl.textContent = "Visitor";
+            pillEl.className = "start-account-pill";
+        }
+        if (optGuest) optGuest.classList.add("active");
+        if (optAdmin) optAdmin.classList.remove("active");
+        if (adminBar) adminBar.style.display = "none";
+        const stickyContainer = document.getElementById("sticky-notes-container");
+        if (stickyContainer) stickyContainer.style.display = "none";
+    }
+}
+
+function renderStartMenuApps() {
+    const grid = document.getElementById("start-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+
+    // Base items from currentDesktopData
+    const baseItems = currentDesktopData.filter(item => {
+        const isSticky = (item.type === "stickynotes" || (item.name && item.name.toLowerCase() === "sticky notes"));
+        if (currentUser !== "admin" && isSticky) {
+            return false;
+        }
+        if (currentUser !== "admin" && item.hiddenForGuest) {
+            return false;
+        }
+        return true;
+    });
+
+    const standardApps = [
+        { name: "Calculator", type: "calculator", customIcon: "fluent:calculator-24-filled" },
+        { name: "Paint", type: "paint", customIcon: "fluent:paint-brush-24-filled" },
+        { name: "Terminal", type: "terminal", customIcon: "fluent:window-console-20-filled" },
+        { name: "Snake Game", type: "snake", customIcon: "fluent:games-24-filled" }
+    ];
+
+    const itemsToShow = [...baseItems];
+    standardApps.forEach(app => {
+        const exists = itemsToShow.some(i => 
+            i.type === app.type || 
+            (i.name && i.name.toLowerCase() === app.name.toLowerCase()) ||
+            (app.type === "calculator" && i.type === "calc")
+        );
+        if (!exists) {
+            itemsToShow.push(app);
+        }
+    });
+
+    if (currentUser === "admin") {
+        if (!itemsToShow.some(i => i.type === "admin_settings" || (i.name && i.name.toLowerCase() === "admin settings"))) {
+            itemsToShow.push({
+                name: "Admin Settings",
+                type: "admin_settings",
+                customIcon: "fluent:settings-24-filled"
+            });
+        }
+    }
+
+    itemsToShow.forEach(item => {
+        const itemDiv = document.createElement("div");
+        itemDiv.className = "start-app";
+        itemDiv.innerHTML = `
+            ${getIconHTML(item, "medium")}
+            <span>${escapeHTML(item.name)}</span>
+        `;
+        itemDiv.addEventListener("click", () => {
+            toggleStartMenu();
+            handleItemClick(item);
+        });
+        grid.appendChild(itemDiv);
+    });
+}
+
+function updateClocks() {
+    const now = new Date();
+    
+    // Taskbar clock: Two lines (Time on top, Date on bottom) matching reference image
+    const hours = now.getHours();
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    const formattedHours = String(hours % 12 || 12).padStart(2, '0');
+    const timeStr = `${formattedHours}:${minutes} ${ampm}`;
+    
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const year = now.getFullYear();
+    const dateStr = `${month}/${day}/${year}`;
+
+    const clockEl = document.getElementById("clock");
+    if (clockEl) {
+        clockEl.innerHTML = `<div class="clock-time">${timeStr}</div><div class="clock-date">${dateStr}</div>`;
+    }
+
+    // Mond Widget on Desktop
+    const days = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+    const months = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+    
+    const mondDay = document.getElementById("mond-day");
+    if (mondDay) mondDay.textContent = days[now.getDay()];
+
+    const mondDate = document.getElementById("mond-date");
+    if (mondDate) mondDate.textContent = `${now.getDate()} ${months[now.getMonth()]}, ${year}.`;
+
+    const mondClock = document.getElementById("mond-clock");
+    if (mondClock) mondClock.textContent = `- ${timeStr} -`;
+}
+
+function escapeHTML(str) {
+    if (typeof str !== 'string') return "";
+    return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+// Power Actions
+export function powerAction(action) {
+    const menu = document.getElementById("start-menu");
+    if (menu) menu.classList.remove("active");
+
+    if (action === "sleep") {
+        const overlay = document.getElementById("sleep-overlay");
+        if (overlay) overlay.classList.add("active");
+    } else if (action === "restart") {
+        window.location.reload();
+    }
+}
+
+export function wakeUp() {
+    const overlay = document.getElementById("sleep-overlay");
+    if (overlay) overlay.classList.remove("active");
+}
+
+// --- Global Right-Click Context Menu & Personalization Window ---
+let activeContextTarget = null;
+let targetItemForCover = null;
+let targetFolderForCover = null;
+
+function initContextMenu() {
+    // Intercept and completely suppress browser native context menu across entire window
+    window.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        handleGlobalContextMenu(e);
+    }, { capture: true });
+
+    document.addEventListener("click", (e) => {
+        const menu = document.getElementById("desktop-context-menu");
+        if (menu && !e.target.closest("#desktop-context-menu")) {
+            menu.style.display = "none";
+        }
+    });
+}
+
+function handleGlobalContextMenu(e) {
+    const menu = document.getElementById("desktop-context-menu");
+    if (!menu) return;
+
+    // Detect if right click is inside a folder window
+    const folderWin = e.target.closest(".window.folder-window");
+    const folderName = folderWin ? (folderWin.getAttribute("data-folder-name") || (folderWin.folderItemRef && folderWin.folderItemRef.name)) : null;
+    let activeFolder = folderName ? findFolderItem(folderName) : null;
+    if (!activeFolder && folderWin && folderWin.folderItemRef) {
+        activeFolder = folderWin.folderItemRef;
+    }
+    if (activeFolder) {
+        currentTargetFolder = activeFolder;
+        if (folderWin) folderWin.folderItemRef = activeFolder;
+    }
+
+    // 1. Check if clicking on an icon (desktop or folder child)
+    const iconEl = e.target.closest(".icon");
+    if (iconEl) {
+        if (iconEl.classList.contains("folder-child") && activeFolder) {
+            const idx = parseInt(iconEl.getAttribute("data-idx"), 10);
+            const item = activeFolder.content?.[idx];
+            if (item) {
+                activeContextTarget = { type: "folder_child", folder: activeFolder, index: idx, item };
+                renderContextMenuForTarget(activeContextTarget, e);
+                return;
+            }
+        } else if (iconEl.hasAttribute("data-index")) {
+            const idx = parseInt(iconEl.getAttribute("data-index"), 10);
+            const item = currentDesktopData[idx];
+            if (item) {
+                activeContextTarget = { type: "desktop_item", index: idx, item };
+                renderContextMenuForTarget(activeContextTarget, e);
+                return;
+            }
+        }
+    }
+
+    // 2. Check if clicking inside a folder window (background)
+    if (folderWin && activeFolder) {
+        activeContextTarget = { type: "folder_bg", folder: activeFolder };
+        renderContextMenuForTarget(activeContextTarget, e);
+        return;
+    }
+
+    // 3. Otherwise desktop background
+    activeContextTarget = { type: "desktop_bg" };
+    renderContextMenuForTarget(activeContextTarget, e);
+}
+
+function renderContextMenuForTarget(target, e) {
+    const menu = document.getElementById("desktop-context-menu");
+    if (!menu) return;
+
+    let html = "";
+
+    if (target.type === "desktop_item" || target.type === "folder_child") {
+        const item = target.item;
+        html += `<div class="ctx-header" style="padding: 6px 10px; font-size: 11px; color: rgba(255,255,255,0.45); border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHTML(item.name)}</div>`;
+        html += `<div class="ctx-item" id="ctx-open"><iconify-icon icon="fluent:open-24-filled" width="16" height="16"></iconify-icon><span>Open</span></div>`;
+        
+        if (currentUser === "admin") {
+            html += `<div class="ctx-separator"></div>`;
+            const eyeIcon = item.hiddenForGuest ? "fluent:eye-24-filled" : "fluent:eye-off-24-filled";
+            const eyeLabel = item.hiddenForGuest ? "Unhide for Guest" : "Hide for Guest";
+            html += `<div class="ctx-item" id="ctx-toggle-hide"><iconify-icon icon="${eyeIcon}" width="16" height="16"></iconify-icon><span>${eyeLabel}</span></div>`;
+            html += `<div class="ctx-item" id="ctx-rename"><iconify-icon icon="fluent:rename-24-filled" width="16" height="16"></iconify-icon><span>Rename</span></div>`;
+            html += `<div class="ctx-item" id="ctx-change-cover"><iconify-icon icon="fluent:image-edit-24-filled" width="16" height="16"></iconify-icon><span>Upload Custom Cover Art</span></div>`;
+            html += `<div class="ctx-separator"></div>`;
+            html += `<div class="ctx-item danger" id="ctx-delete"><iconify-icon icon="fluent:delete-24-filled" width="16" height="16" style="color: #ff5252;"></iconify-icon><span style="color: #ff5252;">Delete</span></div>`;
+        }
+    } else if (target.type === "folder_bg") {
+        html += `<div class="ctx-header" style="padding: 6px 10px; font-size: 11px; color: rgba(255,255,255,0.45); border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 4px;">📁 ${escapeHTML(target.folder.name)}</div>`;
+        if (currentUser === "admin") {
+            html += `<div class="ctx-item" id="ctx-folder-newfolder"><iconify-icon icon="fluent:folder-add-24-filled" width="16" height="16"></iconify-icon><span>New Folder</span></div>`;
+            html += `<div class="ctx-item" id="ctx-folder-newfile"><iconify-icon icon="fluent:document-add-24-filled" width="16" height="16"></iconify-icon><span>New Text Document</span></div>`;
+            html += `<div class="ctx-item" id="ctx-folder-newlink"><iconify-icon icon="fluent:link-add-24-filled" width="16" height="16" style="color: #00a2ed;"></iconify-icon><span>New Web Link</span></div>`;
+            html += `<div class="ctx-item" id="ctx-folder-upload"><iconify-icon icon="fluent:arrow-upload-24-filled" width="16" height="16"></iconify-icon><span>Upload File</span></div>`;
+            if (target.folder.name.toLowerCase() === "music") {
+                html += `<div class="ctx-item" id="ctx-folder-upload-music"><iconify-icon icon="fluent:music-note-2-24-filled" width="16" height="16"></iconify-icon><span>Upload Music & Cover</span></div>`;
+            }
+            html += `<div class="ctx-separator"></div>`;
+        }
+        html += `<div class="ctx-item" id="ctx-folder-refresh"><iconify-icon icon="fluent:arrow-clockwise-24-filled" width="16" height="16"></iconify-icon><span>Refresh</span></div>`;
+    } else {
+        // Desktop Background
+        if (currentUser === "admin") {
+            html += `<div class="ctx-item" id="ctx-personalize"><iconify-icon icon="fluent:paint-brush-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon><span>Personalize (Wallpaper)</span></div>`;
+            html += `<div class="ctx-separator"></div>`;
+            html += `<div class="ctx-item" id="ctx-desktop-newfolder"><iconify-icon icon="fluent:folder-add-24-filled" width="16" height="16"></iconify-icon><span>New Folder</span></div>`;
+            html += `<div class="ctx-item" id="ctx-desktop-newfile"><iconify-icon icon="fluent:document-add-24-filled" width="16" height="16"></iconify-icon><span>New Text Document</span></div>`;
+            html += `<div class="ctx-item" id="ctx-desktop-newlink"><iconify-icon icon="fluent:link-add-24-filled" width="16" height="16" style="color: #00a2ed;"></iconify-icon><span>New Web Link</span></div>`;
+            html += `<div class="ctx-item" id="ctx-desktop-upload-music"><iconify-icon icon="fluent:music-note-2-24-filled" width="16" height="16"></iconify-icon><span>Upload Music & Cover</span></div>`;
+            html += `<div class="ctx-item" id="ctx-desktop-upload"><iconify-icon icon="fluent:arrow-upload-24-filled" width="16" height="16"></iconify-icon><span>Upload File</span></div>`;
+            html += `<div class="ctx-separator"></div>`;
+        }
+        html += `<div class="ctx-item" id="ctx-desktop-refresh"><iconify-icon icon="fluent:arrow-clockwise-24-filled" width="16" height="16"></iconify-icon><span>Refresh</span></div>`;
+    }
+
+    menu.innerHTML = html;
+
+    // Attach listeners
+    attachContextMenuHandlers(target);
+
+    // Calculate positioning
+    const menuWidth = 230;
+    const menuHeight = 320;
+    const x = Math.min(e.clientX, window.innerWidth - menuWidth - 10);
+    const y = Math.min(e.clientY, window.innerHeight - menuHeight - 20);
+
+    menu.style.left = `${Math.max(10, x)}px`;
+    menu.style.top = `${Math.max(10, y)}px`;
+    menu.style.display = "flex";
+}
+
+function attachContextMenuHandlers(target) {
+    const menu = document.getElementById("desktop-context-menu");
+    const closeMenu = () => { if (menu) menu.style.display = "none"; };
+
+    const btnOpen = document.getElementById("ctx-open");
+    if (btnOpen) {
+        btnOpen.addEventListener("click", () => {
+            closeMenu();
+            handleItemClick(target.item);
+        });
+    }
+
+    const btnToggleHide = document.getElementById("ctx-toggle-hide");
+    if (btnToggleHide) {
+        btnToggleHide.addEventListener("click", () => {
+            closeMenu();
+            target.item.hiddenForGuest = !target.item.hiddenForGuest;
+            saveDesktopData(currentDesktopData);
+            if (target.type === "folder_child" && target.folder) {
+                const liveFolder = findFolderItem(target.folder.name) || target.folder;
+                openFolderWindow(liveFolder);
+            } else {
+                renderDesktop();
+            }
+            showToast(`"${target.item.name}" is now ${target.item.hiddenForGuest ? 'hidden for guests (closed eye icon)' : 'visible to guests'}`);
+        });
+    }
+
+    const btnRename = document.getElementById("ctx-rename");
+    if (btnRename) {
+        btnRename.addEventListener("click", async () => {
+            closeMenu();
+            const newName = await winPrompt("Enter new name:", target.item.name, "Rename Item");
+            if (newName && newName.trim()) {
+                const oldName = target.item.name;
+                target.item.name = newName.trim();
+                
+                // If this is a music track, also update in library
+                if (target.item.type === "music") {
+                    const song = currentMusicLibrary.find(s => s.title === oldName);
+                    if (song) song.title = newName.trim();
+                    saveMusicLibrary(currentMusicLibrary);
+                    updateHDDUI();
+                }
+
+                saveDesktopData(currentDesktopData);
+                if (target.type === "folder_child" && target.folder) {
+                    const liveFolder = findFolderItem(target.folder.name) || target.folder;
+                    openFolderWindow(liveFolder);
+                } else {
+                    renderDesktop();
+                }
+                showToast(`Renamed to "${newName.trim()}"`);
+            }
+        });
+    }
+
+    const btnChangeCover = document.getElementById("ctx-change-cover");
+    if (btnChangeCover) {
+        btnChangeCover.addEventListener("click", () => {
+            closeMenu();
+            targetItemForCover = target.item;
+            targetFolderForCover = target.folder || null;
+            const uploader = document.getElementById("cover-art-uploader");
+            if (uploader) uploader.click();
+        });
+    }
+
+    const btnDelete = document.getElementById("ctx-delete");
+    if (btnDelete) {
+        btnDelete.addEventListener("click", async () => {
+            closeMenu();
+            if (currentUser !== "admin") {
+                showToast("Only SPIKETONES007 can delete items.");
+                return;
+            }
+            const confirmed = await winConfirm(`Are you sure you want to permanently delete "${target.item.name}"?`, "Delete Item", true);
+            if (confirmed) {
+                const itemName = target.item.name;
+                const isMusic = target.item.type === "music" || (target.folder && target.folder.name.toLowerCase() === "music");
+                
+                if (target.type === "folder_child" && target.folder) {
+                    const liveFolder = findFolderItem(target.folder.name) || target.folder;
+                    if (Array.isArray(liveFolder.content)) {
+                        let idx = liveFolder.content.findIndex(c => c === target.item || (c.name === itemName && c.type === target.item.type));
+                        if (idx !== -1) {
+                            liveFolder.content.splice(idx, 1);
+                        }
+                    }
+                    openFolderWindow(liveFolder);
+                } else {
+                    let idx = currentDesktopData.findIndex(d => d === target.item || (d.name === itemName && d.type === target.item.type));
+                    if (idx !== -1) {
+                        currentDesktopData.splice(idx, 1);
+                    }
+                    renderDesktop();
+                }
+
+                // If this is a music track, also remove from music library and update player
+                if (isMusic) {
+                    const trackIdx = currentMusicLibrary.findIndex(s => 
+                        s.title.toLowerCase() === itemName.toLowerCase() || 
+                        (target.item.src && s.src === target.item.src)
+                    );
+                    if (trackIdx !== -1) {
+                        currentMusicLibrary.splice(trackIdx, 1);
+                        if (currentTrackIndex >= currentMusicLibrary.length) {
+                            currentTrackIndex = Math.max(0, currentMusicLibrary.length - 1);
+                        }
+                        saveMusicLibrary(currentMusicLibrary);
+                        updateHDDUI();
+                    }
+                }
+
+                saveDesktopData(currentDesktopData);
+                showToast(`Deleted "${itemName}"`);
+            }
+        });
+    }
+
+    const btnPersonalize = document.getElementById("ctx-personalize");
+    if (btnPersonalize) {
+        btnPersonalize.addEventListener("click", () => {
+            closeMenu();
+            openPersonalizationWindow();
+        });
+    }
+
+    // Folder Actions
+    const btnFNewFolder = document.getElementById("ctx-folder-newfolder");
+    if (btnFNewFolder) {
+        btnFNewFolder.addEventListener("click", async () => {
+            closeMenu();
+            if (currentUser !== "admin") return;
+            const liveFolder = findFolderItem(target.folder.name) || target.folder;
+            let defaultName = "New Folder";
+            let counter = 2;
+            while (liveFolder.content && liveFolder.content.some(item => item.name === defaultName)) {
+                defaultName = `New Folder (${counter++})`;
+            }
+            const name = await winPrompt("Enter folder name:", defaultName, "Create Folder");
+            if (name && name.trim()) {
+                if (!liveFolder.content) liveFolder.content = [];
+                liveFolder.content.push({ name: name.trim(), type: "folder", content: [] });
+                saveDesktopData(currentDesktopData);
+                openFolderWindow(liveFolder);
+                showToast(`Created folder "${name.trim()}"`);
+            }
+        });
+    }
+
+    const btnFNewFile = document.getElementById("ctx-folder-newfile");
+    if (btnFNewFile) {
+        btnFNewFile.addEventListener("click", async () => {
+            closeMenu();
+            if (currentUser !== "admin") return;
+            const liveFolder = findFolderItem(target.folder.name) || target.folder;
+            let defaultName = "New Document.txt";
+            let counter = 2;
+            while (liveFolder.content && liveFolder.content.some(item => item.name === defaultName)) {
+                defaultName = `New Document (${counter++}).txt`;
+            }
+            let name = await winPrompt("Enter document name:", defaultName, "Create Text Document");
+            if (name && name.trim()) {
+                name = name.trim();
+                if (!name.endsWith(".txt")) name += ".txt";
+                if (!liveFolder.content) liveFolder.content = [];
+                liveFolder.content.push({ name, type: "file" });
+                fileContentMap[name] = "";
+                saveDesktopData(currentDesktopData);
+                openFolderWindow(liveFolder);
+                openNotepad(name, "");
+                showToast(`Created file "${name}"`);
+            }
+        });
+    }
+
+    const btnFNewLink = document.getElementById("ctx-folder-newlink");
+    if (btnFNewLink) {
+        btnFNewLink.addEventListener("click", () => {
+            closeMenu();
+            if (currentUser !== "admin") return;
+            const liveFolder = findFolderItem(target.folder.name) || target.folder;
+            showNewLinkDialog(liveFolder);
+        });
+    }
+
+    const btnFUpload = document.getElementById("ctx-folder-upload");
+    if (btnFUpload) {
+        btnFUpload.addEventListener("click", () => {
+            closeMenu();
+            currentTargetFolder = findFolderItem(target.folder.name) || target.folder;
+            const uploader = document.getElementById("folder-file-uploader");
+            if (uploader) uploader.click();
+        });
+    }
+
+    const btnFUploadMusic = document.getElementById("ctx-folder-upload-music");
+    if (btnFUploadMusic) {
+        btnFUploadMusic.addEventListener("click", () => {
+            closeMenu();
+            const liveFolder = findFolderItem(target.folder.name) || target.folder;
+            openMusicUploadModal(liveFolder);
+        });
+    }
+
+    const btnFRefresh = document.getElementById("ctx-folder-refresh");
+    if (btnFRefresh) {
+        btnFRefresh.addEventListener("click", () => {
+            closeMenu();
+            const liveFolder = findFolderItem(target.folder.name) || target.folder;
+            openFolderWindow(liveFolder);
+        });
+    }
+
+    // Desktop Actions
+    const btnDNewFolder = document.getElementById("ctx-desktop-newfolder");
+    if (btnDNewFolder) {
+        btnDNewFolder.addEventListener("click", () => {
+            closeMenu();
+            contextNewFolder();
+        });
+    }
+
+    const btnDNewFile = document.getElementById("ctx-desktop-newfile");
+    if (btnDNewFile) {
+        btnDNewFile.addEventListener("click", () => {
+            closeMenu();
+            contextNewTextFile();
+        });
+    }
+
+    const btnDNewLink = document.getElementById("ctx-desktop-newlink");
+    if (btnDNewLink) {
+        btnDNewLink.addEventListener("click", () => {
+            closeMenu();
+            showNewLinkDialog(null);
+        });
+    }
+
+    const btnDUploadMusic = document.getElementById("ctx-desktop-upload-music");
+    if (btnDUploadMusic) {
+        btnDUploadMusic.addEventListener("click", () => {
+            closeMenu();
+            openMusicUploadModal(null);
+        });
+    }
+
+    const btnDUpload = document.getElementById("ctx-desktop-upload");
+    if (btnDUpload) {
+        btnDUpload.addEventListener("click", () => {
+            closeMenu();
+            triggerDesktopUpload();
+        });
+    }
+
+    const btnDRefresh = document.getElementById("ctx-desktop-refresh");
+    if (btnDRefresh) {
+        btnDRefresh.addEventListener("click", () => {
+            closeMenu();
+            renderDesktop();
+            showToast("Desktop refreshed");
+        });
+    }
+}
+
+// --- Personalization Window System ---
+export function openPersonalizationWindow() {
+    if (currentUser !== "admin") {
+        showToast("Personalization settings are restricted to administrator.");
+        return;
+    }
+    const winId = "win-personalization";
+    const existing = document.getElementById(winId);
+    if (existing) {
+        existing.classList.remove("minimized");
+        bringToFront(existing);
+        updateTaskbar();
+        return;
+    }
+
+    const persIcon = `<iconify-icon icon="fluent:paint-brush-24-filled" width="18" height="18" style="color: #ff8c00"></iconify-icon>`;
+    const contentHTML = `
+        <div class="personalize-container">
+            <div class="personalize-section-title">Current Wallpaper</div>
+            <div class="personalize-current-box">
+                <img src="${currentWallpaper}" id="personalize-preview-img" class="personalize-preview-img" alt="Wallpaper Preview" />
+            </div>
+
+            <div class="personalize-section-title">Upload Custom Wallpaper</div>
+            <div class="personalize-upload-dropzone" id="personalize-dropzone">
+                <iconify-icon icon="fluent:image-arrow-counterclockwise-24-filled" width="28" height="28" style="color: #c85627;"></iconify-icon>
+                <div style="font-size: 13px; font-weight: 500;">Click to browse or drag & drop wallpaper image</div>
+                <div style="font-size: 11px; color: rgba(255,255,255,0.45);">Applies to both Desktop and Sign-In screen</div>
+            </div>
+
+            <div class="personalize-section-title">Wallpaper Presets</div>
+            <div class="personalize-preset-grid">
+                <div class="personalize-preset-card" data-url="wall.png">
+                    <img src="wall.png" alt="Warm Sunset" />
+                    <span>Warm Sunset</span>
+                </div>
+                <div class="personalize-preset-card" data-url="files/Monochrome.png">
+                    <img src="files/Monochrome.png" alt="Monochrome" />
+                    <span>Monochrome</span>
+                </div>
+                <div class="personalize-preset-card" data-url="https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1920&q=80">
+                    <img src="https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=300&q=80" alt="Fluent Waves" />
+                    <span>Fluent Waves</span>
+                </div>
+                <div class="personalize-preset-card" data-url="https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=1920&q=80">
+                    <img src="https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=300&q=80" alt="Dark Alpine" />
+                    <span>Dark Alpine</span>
+                </div>
+            </div>
+        </div>
+    `;
+
+    const win = openWindow("Personalization", contentHTML, persIcon, winId, "personalize-window");
+
+    const dropzone = win.querySelector("#personalize-dropzone");
+    const previewImg = win.querySelector("#personalize-preview-img");
+    const wallpaperInput = document.getElementById("wallpaper-file-input");
+
+    if (dropzone && wallpaperInput) {
+        dropzone.addEventListener("click", () => wallpaperInput.click());
+
+        dropzone.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            dropzone.classList.add("drag-over");
+        });
+        dropzone.addEventListener("dragleave", () => {
+            dropzone.classList.remove("drag-over");
+        });
+        dropzone.addEventListener("drop", (e) => {
+            e.preventDefault();
+            dropzone.classList.remove("drag-over");
+            if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                const file = e.dataTransfer.files[0];
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    const dataUrl = ev.target.result;
+                    setWallpaper(dataUrl);
+                    if (previewImg) previewImg.src = dataUrl;
+                    showToast("New wallpaper applied to Desktop and Sign-In Screen!");
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+    }
+
+    win.querySelectorAll(".personalize-preset-card").forEach(card => {
+        card.addEventListener("click", () => {
+            const url = card.getAttribute("data-url");
+            setWallpaper(url);
+            if (previewImg) previewImg.src = url;
+            showToast("Wallpaper updated!");
+        });
+    });
+}
+
+export async function contextNewFolder() {
+    if (currentUser !== "admin") return;
+    let defaultName = "New Folder";
+    let counter = 2;
+    while (currentDesktopData.some(item => item.name === defaultName)) {
+        defaultName = `New Folder (${counter++})`;
+    }
+    const name = await winPrompt("Enter folder name:", defaultName, "Create Folder");
+    if (!name || !name.trim()) return;
+    
+    currentDesktopData.push({
+        name: name.trim(),
+        type: "folder",
+        content: []
+    });
+    
+    saveDesktopData(currentDesktopData);
+    renderDesktop();
+    showToast(`Created folder "${name.trim()}"`);
+}
+
+export async function contextNewTextFile() {
+    if (currentUser !== "admin") return;
+    let defaultName = "New Document.txt";
+    let counter = 2;
+    while (currentDesktopData.some(item => item.name === defaultName)) {
+        defaultName = `New Document (${counter++}).txt`;
+    }
+    let name = await winPrompt("Enter document name:", defaultName, "Create Text Document");
+    if (!name || !name.trim()) return;
+    name = name.trim();
+    if (!name.endsWith(".txt")) name += ".txt";
+    
+    currentDesktopData.push({
+        name,
+        type: "file"
+    });
+    
+    fileContentMap[name] = "";
+    saveDesktopData(currentDesktopData);
+    renderDesktop();
+    openNotepad(name, "");
+    showToast(`Created "${name}"`);
+}
+
+// --- Desktop Drag-to-Select (Marquee Rectangle Selection) ---
+export function initDesktopDragSelect() {
+    const desktop = document.getElementById("desktop");
+    const selectionBox = document.getElementById("desktop-selection-box");
+    if (!desktop || !selectionBox) return;
+
+    let isSelecting = false;
+    let startX = 0;
+    let startY = 0;
+
+    desktop.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        if (e.target.closest(".window") || 
+            e.target.closest(".taskbar") || 
+            e.target.closest("#mond-widget") || 
+            e.target.closest(".sticky-note") || 
+            e.target.closest("#start-menu") || 
+            e.target.closest("#action-center-flyout") || 
+            e.target.closest("#desktop-context-menu") || 
+            e.target.closest(".win-dialog-backdrop")) {
+            return;
+        }
+
+        const clickedIcon = e.target.closest(".icon");
+        if (clickedIcon) {
+            if (!e.ctrlKey && !e.shiftKey) {
+                document.querySelectorAll(".icon.selected").forEach(el => {
+                    if (el !== clickedIcon) el.classList.remove("selected");
+                });
+            }
+            clickedIcon.classList.toggle("selected");
+            return;
+        }
+
+        if (!e.ctrlKey && !e.shiftKey) {
+            document.querySelectorAll(".icon.selected").forEach(el => el.classList.remove("selected"));
+        }
+
+        isSelecting = true;
+        startX = e.clientX;
+        startY = e.clientY;
+
+        selectionBox.style.left = `${startX}px`;
+        selectionBox.style.top = `${startY}px`;
+        selectionBox.style.width = `0px`;
+        selectionBox.style.height = `0px`;
+        selectionBox.style.display = "none";
+    });
+
+    window.addEventListener("mousemove", (e) => {
+        if (!isSelecting) return;
+
+        const currentX = e.clientX;
+        const currentY = e.clientY;
+
+        const x = Math.min(startX, currentX);
+        const y = Math.min(startY, currentY);
+        const width = Math.abs(currentX - startX);
+        const height = Math.abs(currentY - startY);
+
+        if (width > 4 || height > 4) {
+            selectionBox.style.display = "block";
+            selectionBox.style.left = `${x}px`;
+            selectionBox.style.top = `${y}px`;
+            selectionBox.style.width = `${width}px`;
+            selectionBox.style.height = `${height}px`;
+
+            const boxRect = {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height
+            };
+
+            const desktopIcons = document.querySelectorAll("#desktopIcons .icon");
+            desktopIcons.forEach(icon => {
+                const rect = icon.getBoundingClientRect();
+                const intersects = !(
+                    rect.right < boxRect.left ||
+                    rect.left > boxRect.right ||
+                    rect.bottom < boxRect.top ||
+                    rect.top > boxRect.bottom
+                );
+
+                if (intersects) {
+                    icon.classList.add("selected");
+                } else if (!e.ctrlKey && !e.shiftKey) {
+                    icon.classList.remove("selected");
+                }
+            });
+        }
+    });
+
+    const endSelection = () => {
+        if (isSelecting) {
+            isSelecting = false;
+            selectionBox.style.display = "none";
+            selectionBox.style.width = "0px";
+            selectionBox.style.height = "0px";
+        }
+    };
+
+    window.addEventListener("mouseup", endSelection);
+    window.addEventListener("blur", endSelection);
+}
+
+export function triggerDesktopUpload() {
+    const desktopUploader = document.getElementById("desktop-file-uploader");
+    if (desktopUploader) desktopUploader.click();
+}
+
+// --- Direct File Upload Processing ---
+function setupUploaders() {
+    const folderUploader = document.getElementById("folder-file-uploader");
+    const desktopUploader = document.getElementById("desktop-file-uploader");
+    const coverArtUploader = document.getElementById("cover-art-uploader");
+    const wallpaperInput = document.getElementById("wallpaper-file-input");
+    
+    if (folderUploader) {
+        folderUploader.addEventListener("change", () => {
+            if (!folderUploader.files || folderUploader.files.length === 0) return;
+            handleFilesUpload(Array.from(folderUploader.files), currentTargetFolder);
+            folderUploader.value = "";
+        });
+    }
+    
+    if (desktopUploader) {
+        desktopUploader.addEventListener("change", () => {
+            if (!desktopUploader.files || desktopUploader.files.length === 0) return;
+            handleFilesUpload(Array.from(desktopUploader.files), null);
+            desktopUploader.value = "";
+        });
+    }
+
+    if (coverArtUploader) {
+        coverArtUploader.addEventListener("change", () => {
+            if (!coverArtUploader.files || !coverArtUploader.files[0] || !targetItemForCover) return;
+            const file = coverArtUploader.files[0];
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const dataUrl = ev.target.result;
+                targetItemForCover.customIcon = dataUrl;
+                targetItemForCover.cover = dataUrl;
+                if (targetItemForCover.type === "music") {
+                    const song = currentMusicLibrary.find(s => s.title === targetItemForCover.name || s.src === targetItemForCover.src);
+                    if (song) {
+                        song.cover = dataUrl;
+                        saveMusicLibrary(currentMusicLibrary);
+                        updateHDDUI();
+                    }
+                }
+                saveDesktopData(currentDesktopData);
+                if (targetFolderForCover) {
+                    openFolderWindow(targetFolderForCover);
+                } else {
+                    renderDesktop();
+                }
+                showToast(`Custom cover art updated for "${targetItemForCover.name}"!`);
+                targetItemForCover = null;
+                targetFolderForCover = null;
+            };
+            reader.readAsDataURL(file);
+            coverArtUploader.value = "";
+        });
+    }
+
+    if (wallpaperInput) {
+        wallpaperInput.addEventListener("change", () => {
+            if (wallpaperInput.files && wallpaperInput.files[0]) {
+                const file = wallpaperInput.files[0];
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    const dataUrl = ev.target.result;
+                    setWallpaper(dataUrl);
+                    const prev = document.getElementById("personalize-preview-img");
+                    if (prev) prev.src = dataUrl;
+                    showToast("New wallpaper applied to Desktop and Sign-In Screen!");
+                };
+                reader.readAsDataURL(file);
+                wallpaperInput.value = "";
+            }
+        });
+    }
+}
+
+function handleFilesUpload(files, targetFolder = null) {
+    files.forEach(file => {
+        const isAudio = file.type.startsWith("audio/") || file.name.match(/\.(mp3|wav|ogg|m4a|aac|flac)$/i);
+        const isImage = file.type.startsWith("image/") || file.name.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i);
+        
+        if (isAudio) {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const dataUrl = ev.target.result;
+                const cleanName = file.name.replace(/\.[^/.]+$/, "");
+                const musicItem = {
+                    name: cleanName,
+                    type: "music",
+                    src: dataUrl,
+                    customIcon: "fluent:music-note-2-24-filled"
+                };
+                
+                if (targetFolder) {
+                    if (!targetFolder.content) targetFolder.content = [];
+                    targetFolder.content.push(musicItem);
+                    openFolderWindow(targetFolder);
+                } else {
+                    currentDesktopData.push(musicItem);
+                    renderDesktop();
+                }
+                
+                currentMusicLibrary.push({
+                    title: cleanName,
+                    artist: "Local Track",
+                    src: dataUrl,
+                    cover: "files/cover/song1.jpg"
+                });
+                
+                saveMusicLibrary(currentMusicLibrary);
+                saveDesktopData(currentDesktopData);
+                showToast(`Uploaded song "${cleanName}" — now in Music Player!`);
+                updateHDDUI();
+            };
+            reader.readAsDataURL(file);
+        } else if (isImage) {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const dataUrl = ev.target.result;
+                const imgItem = {
+                    name: file.name,
+                    type: "image",
+                    src: dataUrl,
+                    customIcon: dataUrl
+                };
+                if (targetFolder) {
+                    if (!targetFolder.content) targetFolder.content = [];
+                    targetFolder.content.push(imgItem);
+                    openFolderWindow(targetFolder);
+                } else {
+                    currentDesktopData.push(imgItem);
+                    renderDesktop();
+                }
+                saveDesktopData(currentDesktopData);
+                showToast(`Uploaded image "${file.name}"`);
+            };
+            reader.readAsDataURL(file);
+        } else {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const text = ev.target.result;
+                const fileItem = {
+                    name: file.name,
+                    type: "file"
+                };
+                fileContentMap[file.name] = text;
+                localStorage.setItem(`file_${file.name}`, text);
+                
+                if (targetFolder) {
+                    if (!targetFolder.content) targetFolder.content = [];
+                    targetFolder.content.push(fileItem);
+                    openFolderWindow(targetFolder);
+                } else {
+                    currentDesktopData.push(fileItem);
+                    renderDesktop();
+                }
+                saveDesktopData(currentDesktopData);
+                showToast(`Uploaded "${file.name}"`);
+            };
+            reader.readAsText(file);
+        }
+    });
+}
+
+// Global click dismissals
+document.addEventListener("click", (e) => {
+    const startMenu = document.getElementById("start-menu");
+    const userSwitcher = document.getElementById("user-switcher-popup");
+
+    if (userSwitcher && userSwitcher.classList.contains("visible") && !e.target.closest("#user-switcher-popup") && !e.target.closest("#start-user-btn")) {
+        userSwitcher.classList.remove("visible");
+    }
+
+    if (startMenu && startMenu.classList.contains("active") && !e.target.closest("#start-menu") && !e.target.closest(".start-button")) {
+        startMenu.classList.remove("active");
+        if (userSwitcher) userSwitcher.classList.remove("visible");
+    }
+});
+
+// Admin shortcut (fallback)
+window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'E' || e.key === 'e' || e.code === 'KeyE')) {
+        e.preventDefault();
+        openAdminEditMode();
+        return;
+    }
+
+    // Guest Welcome enter key shortcut on lockscreen
+    const lockScreen = document.getElementById("lock-screen");
+    if (lockScreen && lockScreen.style.display !== "none") {
+        if (currentLockSelectedUser === "guest" && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            submitGuestWelcome();
+        }
+    }
+});
+
+// Expose functions to window
+window.toggleStartMenu = toggleStartMenu;
+window.powerAction = powerAction;
+window.wakeUp = wakeUp;
+window.openAdminEditMode = openAdminEditMode;
+window.openOwnerEditMode = openAdminEditMode;
+window.switchUser = switchUser;
+window.toggleUserSwitcher = toggleUserSwitcher;
+
+// Lockscreen & Security bindings
+window.handleLockSubmit = handleLockSubmit;
+window.selectLockUser = selectLockUser;
+window.submitGuestWelcome = submitGuestWelcome;
+window.showForgotPinPrompt = showForgotPinPrompt;
+window.toggleSignInOptions = toggleSignInOptions;
+window.lockSystem = lockSystem;
+window.unlockSystem = unlockSystem;
+
+// Context Menu & Windows bindings
+window.contextNewFolder = contextNewFolder;
+window.contextNewTextFile = contextNewTextFile;
+window.triggerDesktopUpload = triggerDesktopUpload;
+window.openPersonalizationWindow = openPersonalizationWindow;
+window.openGuestbook = openGuestbook;
+
+// App launcher bindings
+window.openCalculator = openCalculator;
+window.openPaint = openPaint;
+window.openTerminal = openTerminal;
+window.openSnake = openSnake;
+window.openNotepad = openNotepad;
+window.createStickyNote = createStickyNote;
+window.openStickyNotes = openStickyNotes;
+window.openMusicUploadModal = openMusicUploadModal;
+window.closeMusicUploadModal = closeMusicUploadModal;
+
+// ==========================================================================
+// STICKY NOTES SYSTEM
+// ==========================================================================
+let stickyNotes = [];
+
+function loadStickyNotes() {
+    try {
+        const saved = localStorage.getItem("spiketones_sticky_notes");
+        if (saved) {
+            stickyNotes = JSON.parse(saved);
+        } else {
+            stickyNotes = [];
+        }
+    } catch (e) {
+        stickyNotes = [];
+    }
+}
+
+function saveStickyNotes() {
+    try {
+        localStorage.setItem("spiketones_sticky_notes", JSON.stringify(stickyNotes));
+    } catch (e) {
+        console.error("Failed to save sticky notes", e);
+    }
+}
+
+export function createStickyNote(initialText = "", color = "yellow", posX = null, posY = null) {
+    loadStickyNotes();
+    const id = `note-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const offset = (stickyNotes.length * 28) % 140;
+    const note = {
+        id,
+        text: initialText,
+        color: color || "yellow",
+        x: posX !== null ? posX : 140 + offset,
+        y: posY !== null ? posY : 120 + offset,
+        width: 250,
+        height: 230
+    };
+    stickyNotes.push(note);
+    saveStickyNotes();
+    renderStickyNoteElement(note);
+    showToast("Sticky Note created");
+    return note;
+}
+
+export function openStickyNotes() {
+    loadStickyNotes();
+    const container = document.getElementById("sticky-notes-container");
+    if (!container) return;
+
+    if (stickyNotes.length === 0) {
+        createStickyNote("📌 SPIKETONES007 OS Notes\n\n• Click + for a new note\n• Click 🎨 to switch theme\n• Drag anywhere across your desktop!", "yellow", 160, 130);
+    } else {
+        stickyNotes.forEach(n => {
+            if (!document.getElementById(n.id)) {
+                renderStickyNoteElement(n);
+            }
+        });
+        showToast("Sticky Notes displayed");
+    }
+}
+
+function renderStickyNoteElement(note) {
+    const container = document.getElementById("sticky-notes-container");
+    if (!container) return;
+
+    let el = document.getElementById(note.id);
+    if (el) el.remove();
+
+    el = document.createElement("div");
+    el.className = `stickynote theme-${note.color || 'yellow'}`;
+    el.id = note.id;
+    el.style.left = `${note.x}px`;
+    el.style.top = `${note.y}px`;
+    if (note.width) el.style.width = `${note.width}px`;
+    if (note.height) el.style.height = `${note.height}px`;
+
+    el.innerHTML = `
+        <div class="stickynote-header">
+            <div class="stickynote-actions-left">
+                <button class="stickynote-btn btn-new-note" title="New Note">+</button>
+            </div>
+            <div class="stickynote-actions-right">
+                <button class="stickynote-btn btn-color-note" title="Change Color">🎨</button>
+                <button class="stickynote-btn btn-delete-note" title="Delete Note">✕</button>
+            </div>
+        </div>
+        <div class="stickynote-palette" style="display: none;">
+            <div class="stickynote-color-dot" data-color="yellow" style="background: #fff9b0;" title="Yellow"></div>
+            <div class="stickynote-color-dot" data-color="green" style="background: #e4f9b8;" title="Green"></div>
+            <div class="stickynote-color-dot" data-color="pink" style="background: #ffd5e5;" title="Pink"></div>
+            <div class="stickynote-color-dot" data-color="blue" style="background: #cce8ff;" title="Blue"></div>
+            <div class="stickynote-color-dot" data-color="purple" style="background: #ead9ff;" title="Purple"></div>
+            <div class="stickynote-color-dot" data-color="dark" style="background: #282625;" title="Dark"></div>
+        </div>
+        <div class="stickynote-body">
+            <textarea class="stickynote-textarea" placeholder="Type your note here...">${escapeHTML(note.text || '')}</textarea>
+        </div>
+    `;
+
+    container.appendChild(el);
+    bringToFront(el);
+
+    // Draggable header
+    const header = el.querySelector(".stickynote-header");
+    let isDragging = false;
+    let startX = 0, startY = 0, initialLeft = 0, initialTop = 0;
+
+    header.addEventListener("mousedown", (e) => {
+        if (e.target.closest(".stickynote-btn")) return;
+        isDragging = true;
+        bringToFront(el);
+        const rect = el.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        initialLeft = rect.left;
+        initialTop = rect.top;
+
+        const onMouseMove = (ev) => {
+            if (!isDragging) return;
+            const dx = ev.clientX - startX;
+            const dy = ev.clientY - startY;
+            const newX = Math.max(0, initialLeft + dx);
+            const newY = Math.max(0, initialTop + dy);
+            el.style.left = `${newX}px`;
+            el.style.top = `${newY}px`;
+            note.x = newX;
+            note.y = newY;
+        };
+
+        const onMouseUp = () => {
+            if (isDragging) {
+                isDragging = false;
+                saveStickyNotes();
+            }
+            document.removeEventListener("mousemove", onMouseMove);
+            document.removeEventListener("mouseup", onMouseUp);
+        };
+
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseup", onMouseUp);
+    });
+
+    el.addEventListener("mousedown", () => bringToFront(el));
+
+    // Text area auto-save
+    const textarea = el.querySelector(".stickynote-textarea");
+    textarea.addEventListener("input", () => {
+        note.text = textarea.value;
+        saveStickyNotes();
+    });
+
+    // Resize observer
+    if (window.ResizeObserver) {
+        const ro = new ResizeObserver(() => {
+            if (el.offsetWidth > 100 && el.offsetHeight > 100) {
+                note.width = Math.round(el.offsetWidth);
+                note.height = Math.round(el.offsetHeight);
+                saveStickyNotes();
+            }
+        });
+        ro.observe(el);
+    }
+
+    // Header buttons
+    const btnNew = el.querySelector(".btn-new-note");
+    btnNew.addEventListener("click", () => {
+        const nextX = (note.x || 120) + 40;
+        const nextY = (note.y || 120) + 40;
+        createStickyNote("", note.color || "yellow", nextX, nextY);
+    });
+
+    const palette = el.querySelector(".stickynote-palette");
+    const btnColor = el.querySelector(".btn-color-note");
+    btnColor.addEventListener("click", (e) => {
+        e.stopPropagation();
+        palette.style.display = palette.style.display === "none" ? "flex" : "none";
+    });
+
+    el.querySelectorAll(".stickynote-color-dot").forEach(dot => {
+        dot.addEventListener("click", () => {
+            const chosenColor = dot.getAttribute("data-color");
+            el.className = `stickynote theme-${chosenColor}`;
+            note.color = chosenColor;
+            saveStickyNotes();
+            palette.style.display = "none";
+        });
+    });
+
+    const btnDel = el.querySelector(".btn-delete-note");
+    btnDel.addEventListener("click", () => {
+        el.remove();
+        stickyNotes = stickyNotes.filter(n => n.id !== note.id);
+        saveStickyNotes();
+        showToast("Sticky note removed");
+    });
+}
+
+// ==========================================================================
+// MUSIC UPLOAD & CUSTOM COVER MODAL SYSTEM
+// ==========================================================================
+let selectedModalAudioDataUrl = null;
+let selectedModalAudioFileName = "";
+let selectedModalCoverDataUrl = "files/cover/song1.jpg";
+let currentMusicModalFolder = null;
+
+export function openMusicUploadModal(targetFolder = null) {
+    currentMusicModalFolder = targetFolder || currentDesktopData.find(d => d.name === "Music");
+    const overlay = document.getElementById("music-upload-overlay");
+    if (!overlay) return;
+
+    selectedModalAudioDataUrl = null;
+    selectedModalAudioFileName = "";
+    selectedModalCoverDataUrl = "files/cover/song1.jpg";
+
+    const nameLabel = document.getElementById("modal-audio-name");
+    if (nameLabel) nameLabel.textContent = "Click or drag & drop audio track";
+    const audioPreview = document.getElementById("modal-audio-preview");
+    if (audioPreview) {
+        audioPreview.style.display = "none";
+        audioPreview.src = "";
+    }
+    const coverPreviewImg = document.getElementById("modal-cover-preview-img");
+    if (coverPreviewImg) coverPreviewImg.src = "files/cover/song1.jpg";
+    const titleInput = document.getElementById("modal-music-title");
+    if (titleInput) titleInput.value = "";
+    const artistInput = document.getElementById("modal-music-artist");
+    if (artistInput) artistInput.value = "";
+    const confirmBtn = document.getElementById("btn-confirm-music-modal");
+    if (confirmBtn) confirmBtn.disabled = true;
+
+    overlay.style.display = "flex";
+}
+
+export function closeMusicUploadModal() {
+    const overlay = document.getElementById("music-upload-overlay");
+    if (overlay) overlay.style.display = "none";
+    const audioPreview = document.getElementById("modal-audio-preview");
+    if (audioPreview) audioPreview.pause();
+}
+
+function setupMusicUploadModal() {
+    const overlay = document.getElementById("music-upload-overlay");
+    const closeBtn = document.getElementById("btn-close-music-upload");
+    const cancelBtn = document.getElementById("btn-cancel-music-modal");
+    const confirmBtn = document.getElementById("btn-confirm-music-modal");
+    const audioDropZone = document.getElementById("music-audio-dropzone");
+    const audioInput = document.getElementById("modal-audio-input");
+    const audioPreview = document.getElementById("modal-audio-preview");
+    const audioNameLabel = document.getElementById("modal-audio-name");
+    const coverBrowseBtn = document.getElementById("btn-browse-cover");
+    const coverInput = document.getElementById("modal-cover-input");
+    const coverPreviewBox = document.getElementById("modal-cover-preview-box");
+    const coverPreviewImg = document.getElementById("modal-cover-preview-img");
+    const titleInput = document.getElementById("modal-music-title");
+    const artistInput = document.getElementById("modal-music-artist");
+    const presetThumbs = document.querySelectorAll(".cover-preset-thumb");
+
+    if (closeBtn) closeBtn.addEventListener("click", closeMusicUploadModal);
+    if (cancelBtn) cancelBtn.addEventListener("click", closeMusicUploadModal);
+
+    if (overlay) {
+        overlay.addEventListener("click", (e) => {
+            if (e.target === overlay) closeMusicUploadModal();
+        });
+    }
+
+    presetThumbs.forEach(thumb => {
+        thumb.addEventListener("click", () => {
+            const src = thumb.getAttribute("data-src");
+            selectedModalCoverDataUrl = src;
+            if (coverPreviewImg) coverPreviewImg.src = src;
+        });
+    });
+
+    if (coverBrowseBtn && coverInput) {
+        coverBrowseBtn.addEventListener("click", () => coverInput.click());
+    }
+    if (coverPreviewBox && coverInput) {
+        coverPreviewBox.addEventListener("click", () => coverInput.click());
+    }
+    if (coverInput) {
+        coverInput.addEventListener("change", () => {
+            if (coverInput.files && coverInput.files[0]) {
+                const file = coverInput.files[0];
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    selectedModalCoverDataUrl = e.target.result;
+                    if (coverPreviewImg) coverPreviewImg.src = selectedModalCoverDataUrl;
+                    showToast("Custom cover art loaded!");
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+    }
+
+    if (audioDropZone && audioInput) {
+        audioDropZone.addEventListener("click", () => audioInput.click());
+
+        audioDropZone.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            audioDropZone.classList.add("drag-over");
+        });
+        audioDropZone.addEventListener("dragleave", () => {
+            audioDropZone.classList.remove("drag-over");
+        });
+        audioDropZone.addEventListener("drop", (e) => {
+            e.preventDefault();
+            audioDropZone.classList.remove("drag-over");
+            if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                loadAudioFileForModal(e.dataTransfer.files[0]);
+            }
+        });
+
+        audioInput.addEventListener("change", () => {
+            if (audioInput.files && audioInput.files[0]) {
+                loadAudioFileForModal(audioInput.files[0]);
+            }
+        });
+    }
+
+    function loadAudioFileForModal(file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            selectedModalAudioDataUrl = e.target.result;
+            selectedModalAudioFileName = file.name;
+
+            if (audioNameLabel) audioNameLabel.textContent = `🎵 ${file.name}`;
+            if (audioPreview) {
+                audioPreview.src = selectedModalAudioDataUrl;
+                audioPreview.style.display = "block";
+            }
+
+            const cleanBase = file.name.replace(/\.[^/.]+$/, "");
+            let autoArtist = "";
+            let autoTitle = cleanBase;
+
+            if (cleanBase.includes(" - ")) {
+                const parts = cleanBase.split(" - ");
+                autoArtist = parts[0].trim();
+                autoTitle = parts.slice(1).join(" - ").trim();
+            }
+
+            if (titleInput && (!titleInput.value || titleInput.value.trim() === "")) {
+                titleInput.value = autoTitle;
+            }
+            if (artistInput && (!artistInput.value || artistInput.value.trim() === "")) {
+                artistInput.value = autoArtist || "SPIKETONES";
+            }
+
+            if (confirmBtn) confirmBtn.disabled = false;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    if (confirmBtn) {
+        confirmBtn.addEventListener("click", async () => {
+            if (!selectedModalAudioDataUrl) {
+                showToast("Please select an audio file first!", false);
+                return;
+            }
+
+            const title = (titleInput && titleInput.value.trim()) || selectedModalAudioFileName.replace(/\.[^/.]+$/, "") || "Custom Track";
+            const artist = (artistInput && artistInput.value.trim()) || "Unknown Artist";
+            const cover = selectedModalCoverDataUrl || "files/cover/song1.jpg";
+
+            let musicFolder = currentMusicModalFolder;
+            if (!musicFolder) {
+                musicFolder = currentDesktopData.find(d => d.name === "Music");
+            }
+            if (musicFolder) {
+                if (!musicFolder.content) musicFolder.content = [];
+                musicFolder.content.push({
+                    name: title,
+                    type: "music",
+                    src: selectedModalAudioDataUrl,
+                    customIcon: cover,
+                    artist: artist
+                });
+                openFolderWindow(musicFolder);
+            }
+
+            const newTrack = {
+                title: title,
+                artist: artist,
+                src: selectedModalAudioDataUrl,
+                cover: cover
+            };
+            currentMusicLibrary.push(newTrack);
+            currentTrackIndex = currentMusicLibrary.length - 1;
+
+            await saveMusicLibrary(currentMusicLibrary);
+            await saveDesktopData(currentDesktopData);
+
+            audio.src = selectedModalAudioDataUrl;
+            updateHDDUI();
+
+            closeMusicUploadModal();
+            showToast(`Added "${title}" with custom cover!`);
+        });
+    }
+}
+
+// --- Admin Firebase Status Widget ---
+function initFirebaseStatusWidget() {
+    const widget = document.getElementById("firebase-status-widget");
+    if (!widget) return;
+
+    const dot = document.getElementById("fb-status-dot");
+    const stateEl = document.getElementById("fb-status-state");
+    const timeEl = document.getElementById("fb-status-time");
+
+    const updateUI = (status) => {
+        if (!stateEl || !timeEl || !dot) return;
+        
+        if (status.isUp) {
+            dot.className = "fb-status-dot up";
+            stateEl.textContent = "UP";
+            stateEl.style.color = "#2ed573";
+            const timeStr = status.lastUpdated ? status.lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : "Connected";
+            timeEl.textContent = `Synced: ${timeStr}`;
+            widget.title = `Firebase Firestore is UP (spiketones7). Last updated: ${timeStr}. Click to test connection.`;
+        } else {
+            dot.className = "fb-status-dot offline";
+            stateEl.textContent = "OFFLINE";
+            stateEl.style.color = "#ff4757";
+            timeEl.textContent = "Local Cache";
+            widget.title = "Firebase is currently offline or unreachable. Click to test connection.";
+        }
+    };
+
+    subscribeFirebaseStatus(updateUI);
+
+    widget.addEventListener("click", async () => {
+        if (dot) dot.className = "fb-status-dot syncing";
+        if (stateEl) stateEl.textContent = "PING...";
+        showToast("Testing Firebase Firestore connection (spiketones7)...");
+        const ok = await pingFirebase();
+        if (ok) {
+            showToast("Firebase Firestore is UP and active! (spiketones7)");
+        } else {
+            showToast("Firebase is offline or unconfigured. Working locally.");
+        }
+    });
+}
+
+// --- Initial Boot Sequence ---
+window.addEventListener("DOMContentLoaded", () => {
+    initFirebaseStatusWidget();
+    updateUserUI();
+    renderDesktop();
+    initHDDPlayer();
+    updateClocks();
+    initContextMenu();
+    initDesktopDragSelect();
+    setupUploaders();
+    setupMusicUploadModal();
+    loadStickyNotes();
+    if (stickyNotes.length > 0) {
+        stickyNotes.forEach(n => renderStickyNoteElement(n));
+    }
+    setInterval(updateClocks, 1000);
+
+    // Open Socials window matching screenshot layout
+    const socialsItem = currentDesktopData.find(d => d.name === "Socials");
+    if (socialsItem) {
+        openFolderWindow(socialsItem);
+    }
+
+    // Open Guestbook panel docked at bottom-right matching screenshot layout
+    openGuestbook();
+
+    // Check & synchronize with remote Firebase Firestore config
+    loadRemoteConfig().then(config => {
+        if (config.wallpaper && config.wallpaper !== currentWallpaper) {
+            currentWallpaper = config.wallpaper;
+            document.body.style.backgroundImage = `url('${currentWallpaper}')`;
+        }
+        if (config.desktopData && Array.isArray(config.desktopData)) {
+            currentDesktopData = config.desktopData;
+            renderDesktop();
+        }
+        if (config.musicLibrary && Array.isArray(config.musicLibrary)) {
+            currentMusicLibrary = config.musicLibrary;
+            updateHDDUI();
+        }
+    });
+
+    // Real-time synchronization for changes made by owner
+    subscribeRemoteConfig((key, value) => {
+        if (key === 'wallpaper' && value) {
+            currentWallpaper = value;
+            document.body.style.backgroundImage = `url('${currentWallpaper}')`;
+        } else if (key === 'desktopData' && Array.isArray(value)) {
+            currentDesktopData = value;
+            renderDesktop();
+        } else if (key === 'musicLibrary' && Array.isArray(value)) {
+            currentMusicLibrary = value;
+            updateHDDUI();
+        }
+    });
+});

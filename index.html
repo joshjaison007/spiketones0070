@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SPIKETONES007 OS</title>
+    <meta name="description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
+    <meta property="og:title" content="SPIKETONES007 OS" />
+    <meta property="og:description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+    <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+    <div id="sleep-overlay" class="sleep-overlay" onclick="wakeUp()"></div>
+
+    <!-- Windows 11 Lock / Login Screen -->
+    <div id="lock-screen" class="lock-screen" style="display: none;">
+        <div class="lock-screen-bg" id="lock-screen-bg"></div>
+        <div class="lock-screen-content">
+            <div class="lock-avatar-circle">
+                <svg width="68" height="68" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="8" r="4.5"></circle>
+                    <path d="M4 20c0-4 4-6.5 8-6.5s8 2.5 8 6.5"></path>
+                </svg>
+            </div>
+            <div class="lock-user-name" id="lock-user-name">SPIKETONES007</div>
+            
+            <form id="lock-form" class="lock-form" onsubmit="window.handleLockSubmit(event)">
+                <div class="lock-input-wrap">
+                    <input type="password" id="lock-pin-input" class="lock-pin-input" placeholder="Password" autocomplete="off" spellcheck="false" autofocus />
+                    <button type="submit" class="lock-submit-btn" id="lock-submit-btn" title="Sign In">➔</button>
+                </div>
+                <div class="lock-error-msg" id="lock-error-msg"></div>
+            </form>
+
+            <div id="lock-guest-wrap" class="lock-guest-wrap" style="display: none;">
+                <button type="button" class="lock-welcome-btn" id="lock-welcome-btn" onclick="window.submitGuestWelcome()">
+                    <span class="welcome-btn-text" id="welcome-btn-text">Welcome</span>
+                    <div class="win-ring-spinner" id="welcome-spinner" style="display: none;"></div>
+                </button>
+            </div>
+        </div>
+
+        <!-- Lock Screen Bottom Left: User Switcher -->
+        <div class="lock-bottom-left">
+            <div class="lock-user-tile active" id="lock-tile-admin" onclick="window.selectLockUser('admin')">
+                <div class="lock-tile-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                </div>
+                <span>SPIKETONES007</span>
+            </div>
+            <div class="lock-user-tile" id="lock-tile-guest" onclick="window.selectLockUser('guest')">
+                <div class="lock-tile-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="7" r="4"></circle>
+                        <path d="M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                    </svg>
+                </div>
+                <span>Guest</span>
+            </div>
+        </div>
+
+        <!-- Lock Screen Bottom Right: System Buttons -->
+        <div class="lock-bottom-right">
+            <button class="lock-sys-btn" title="Internet Connected">
+                <iconify-icon icon="fluent:wifi-1-24-filled" width="20" height="20"></iconify-icon>
+            </button>
+            <button class="lock-sys-btn" title="Accessibility">
+                <iconify-icon icon="fluent:accessibility-24-filled" width="20" height="20"></iconify-icon>
+            </button>
+            <button class="lock-sys-btn" onclick="powerAction('sleep')" title="Power / Sleep">
+                <iconify-icon icon="fluent:power-24-filled" width="20" height="20"></iconify-icon>
+            </button>
+        </div>
+    </div>
+
+    <!-- Unified Desktop & Folder Context Menu -->
+    <div id="desktop-context-menu" class="desktop-context-menu" style="display: none;"></div>
+
+    <!-- Hidden file inputs for uploading files and album covers -->
+    <input type="file" id="folder-file-uploader" style="display: none;" multiple />
+    <input type="file" id="desktop-file-uploader" style="display: none;" multiple />
+    <input type="file" id="cover-art-uploader" accept="image/*" style="display: none;" />
+    <input type="file" id="wallpaper-file-input" accept="image/*" style="display: none;" />
+    <input type="file" id="admin-wallpaper-uploader" accept="image/*" style="display: none;" />
+
+    <div id="desktop" class="desktop">
+        <div id="mond-widget">
+            <div class="mond-day" id="mond-day">FRIDAY</div>
+            <div class="mond-date" id="mond-date">11 SEPTEMBER, 2026.</div>
+            <div class="mond-clock" id="mond-clock">- 03:43 AM -</div>
+        </div>
+        <div class="desktop-icons" id="desktopIcons"></div>
+        <div id="desktop-selection-box" class="desktop-selection-box" style="display: none;"></div>
+        <div id="sticky-notes-container"></div>
+        <div id="window-container"></div>
+    </div>
+
+    <div id="start-menu" class="start-menu">
+        <!-- User Switcher Dropdown (pops up when clicking user button) -->
+        <div class="user-switcher-popup" id="user-switcher-popup">
+            <div class="user-switcher-label">Switch Account</div>
+            <div class="user-option" id="user-opt-guest" onclick="window.switchUser('guest')">
+                <div class="user-option-avatar guest">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/></svg>
+                </div>
+                <div class="user-option-text">
+                    <span class="user-option-name">Guest</span>
+                    <span class="user-option-desc">Guest (Browse only)</span>
+                </div>
+                <span class="user-option-check" id="check-guest">✓</span>
+            </div>
+            <div class="user-option" id="user-opt-admin" onclick="window.switchUser('admin')">
+                <div class="user-option-avatar admin">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                </div>
+                <div class="user-option-text">
+                    <span class="user-option-name">SPIKETONES007</span>
+                    <span class="user-option-desc">Administrator</span>
+                </div>
+                <span class="user-option-check" id="check-admin">✓</span>
+            </div>
+        </div>
+
+        <div class="start-menu-header">
+            <span>Pinned Apps</span>
+            <span class="start-account-pill" id="start-account-pill">Guest</span>
+        </div>
+
+        <div class="start-grid-wrapper">
+            <div class="start-grid" id="start-grid"></div>
+        </div>
+
+        <!-- Quick Admin Action (visible when logged into Admin) -->
+        <div class="admin-quick-bar" id="admin-quick-bar" style="display: none;">
+            <button class="admin-quick-btn" onclick="window.openAdminEditMode()">
+                <iconify-icon icon="fluent:settings-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
+                <span>Open Desktop & Wallpaper Editor</span>
+            </button>
+        </div>
+
+        <div class="start-footer">
+            <div class="start-user-btn" id="start-user-btn" onclick="window.toggleUserSwitcher(event)" title="Click to switch account">
+                <div class="start-user-avatar guest" id="start-user-avatar">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/></svg>
+                </div>
+                <div class="start-user-info">
+                    <span class="start-user-name" id="start-user-name">Guest</span>
+                    <span class="start-user-role" id="start-user-role">Guest</span>
+                </div>
+                <span class="start-user-caret">▲</span>
+            </div>
+            <div class="start-power-btns">
+                <button class="start-power-btn" onclick="powerAction('sleep')" title="Sleep">
+                    <iconify-icon icon="fluent:weather-moon-24-filled" width="16" height="16"></iconify-icon>
+                </button>
+                <button class="start-power-btn danger" onclick="powerAction('restart')" title="Restart">
+                    <iconify-icon icon="fluent:arrow-clockwise-24-filled" width="16" height="16"></iconify-icon>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Music Upload & Custom Cover Modal -->
+    <div id="music-upload-overlay" class="music-upload-overlay" style="display: none;">
+        <div class="music-upload-card">
+            <div class="music-upload-header">
+                <div class="music-upload-title">
+                    <iconify-icon icon="fluent:music-note-2-24-filled" width="20" height="20" style="color: #ff8c00;"></iconify-icon>
+                    <span>Upload Music & Custom Cover</span>
+                </div>
+                <button class="music-upload-close" id="btn-close-music-upload" title="Close">✕</button>
+            </div>
+            <div class="music-upload-body">
+                <!-- Step 1: Audio File -->
+                <div class="music-upload-section">
+                    <label class="music-upload-label">
+                        <iconify-icon icon="fluent:speaker-2-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
+                        <span>1. Audio File (MP3, WAV, OGG, FLAC, M4A)</span>
+                    </label>
+                    <div class="music-drop-zone" id="music-audio-dropzone">
+                        <input type="file" id="modal-audio-input" accept="audio/*" style="display: none;" />
+                        <iconify-icon icon="fluent:arrow-upload-24-filled" width="28" height="28" style="color: #ff8c00;"></iconify-icon>
+                        <div class="drop-text" id="modal-audio-name">Click or drag & drop audio track</div>
+                        <div class="drop-subtext">Supported formats: .mp3, .wav, .ogg, .flac, .m4a</div>
+                    </div>
+                    <audio id="modal-audio-preview" controls style="display: none; width: 100%; margin-top: 6px; height: 32px;"></audio>
+                </div>
+
+                <!-- Step 2: Custom Cover Art -->
+                <div class="music-upload-section">
+                    <label class="music-upload-label">
+                        <iconify-icon icon="fluent:image-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
+                        <span>2. Custom Cover Art (PNG, JPG, WEBP)</span>
+                    </label>
+                    <div style="display: flex; gap: 14px; align-items: center;">
+                        <div class="cover-preview-box" id="modal-cover-preview-box" title="Click to upload custom cover image">
+                            <img id="modal-cover-preview-img" src="files/cover/song1.jpg" alt="Cover Preview" />
+                        </div>
+                        <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
+                            <input type="file" id="modal-cover-input" accept="image/*" style="display: none;" />
+                            <button class="folder-action-btn primary" type="button" id="btn-browse-cover">
+                                <iconify-icon icon="fluent:image-add-24-filled" width="16" height="16"></iconify-icon>
+                                <span>Browse Cover Image</span>
+                            </button>
+                            <div style="font-size: 11px; color: rgba(255,255,255,0.45);">Or pick default cover preset:</div>
+                            <div style="display: flex; gap: 6px;" id="modal-cover-presets">
+                                <img class="cover-preset-thumb" data-src="files/cover/song1.jpg" src="files/cover/song1.jpg" title="Song 1 Cover" />
+                                <img class="cover-preset-thumb" data-src="files/cover/song2.jpg" src="files/cover/song2.jpg" title="Song 2 Cover" />
+                                <img class="cover-preset-thumb" data-src="files/cover/song3.jpg" src="files/cover/song3.jpg" title="Song 3 Cover" />
+                                <img class="cover-preset-thumb" data-src="files/cover/song4.jpg" src="files/cover/song4.jpg" title="Song 4 Cover" />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 3: Track Metadata -->
+                <div class="music-upload-row">
+                    <div class="music-field" style="flex: 1;">
+                        <label class="music-upload-label">Track Title</label>
+                        <input type="text" id="modal-music-title" class="music-text-input" placeholder="e.g. Too Many Nights" />
+                    </div>
+                    <div class="music-field" style="flex: 1;">
+                        <label class="music-upload-label">Artist Name</label>
+                        <input type="text" id="modal-music-artist" class="music-text-input" placeholder="e.g. Metro Boomin" />
+                    </div>
+                </div>
+            </div>
+            <div class="music-upload-footer">
+                <button class="folder-action-btn" id="btn-cancel-music-modal">Cancel</button>
+                <button class="folder-action-btn primary" id="btn-confirm-music-modal" disabled>
+                    <iconify-icon icon="fluent:checkmark-24-filled" width="15" height="15"></iconify-icon>
+                    <span>Add to Music Folder & Player</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <footer class="taskbar">
+        <div class="taskbar-left">
+            <div class="start-button" onclick="toggleStartMenu(event)" title="Start">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="#b84d26">
+                    <path d="M0 11.4545H11.4545V0H0V11.4545ZM12.5455 11.4545H24V0H12.5455V11.4545ZM0 24H11.4545V12.5455H0V24ZM12.5455 24H24V12.5455H12.5455V24Z"/>
+                </svg>
+            </div>
+            <div id="taskbar-apps" class="taskbar-apps"></div>
+        </div>
+        <div class="taskbar-right">
+            <div id="firebase-status-widget" class="firebase-status-widget admin-only" title="Firebase Firestore Database Status (spiketones7). Click to test connection.">
+                <span class="fb-status-dot up" id="fb-status-dot"></span>
+                <div class="fb-status-info">
+                    <span class="fb-status-title">DB: <strong id="fb-status-state">UP</strong></span>
+                    <span class="fb-status-sub" id="fb-status-time">Live Sync</span>
+                </div>
+            </div>
+            <div id="clock"></div>
+        </div>
+    </footer>
+
+    <script type="module" src="/script.js"></script>
+</body>
+</html>
+
