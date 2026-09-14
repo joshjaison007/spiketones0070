@@ -8,12 +8,18 @@ import {
     getDocs, 
     onSnapshot, 
     setDoc, 
-    getDoc,
+    getDoc, 
     doc, 
     query, 
-    orderBy,
-    deleteDoc
+    orderBy, 
+    deleteDoc 
 } from "firebase/firestore";
+import { 
+    getStorage, 
+    ref as storageRef, 
+    uploadBytes, 
+    getDownloadURL 
+} from "firebase/storage";
 
 // User provided Firebase configuration for spiketones7
 export const firebaseConfig = {
@@ -28,12 +34,18 @@ export const firebaseConfig = {
 
 let app = null;
 let db = null;
+let storage = null;
 let analytics = null;
 let isConfigured = false;
 
 try {
     app = initializeApp(firebaseConfig);
     db = getFirestore(app);
+    try {
+        storage = getStorage(app);
+    } catch (sErr) {
+        console.warn("Firebase Storage initialization warning:", sErr);
+    }
     isConfigured = true;
     console.log("Firebase App & Firestore initialized for:", firebaseConfig.projectId);
 
@@ -53,9 +65,17 @@ export function isFirebaseConfigured() {
     return isConfigured && db !== null;
 }
 
+export function isFirebaseStorageConfigured() {
+    return isConfigured && storage !== null;
+}
+
 export { 
     app, 
     db, 
+    storage,
+    storageRef,
+    uploadBytes,
+    getDownloadURL,
     analytics, 
     collection, 
     addDoc, 
@@ -65,6 +85,6 @@ export {
     getDoc, 
     doc, 
     query, 
-    orderBy,
-    deleteDoc
+    orderBy, 
+    deleteDoc 
 };

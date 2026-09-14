@@ -1,6 +1,10 @@
-// Database connection layer supporting Firebase Firestore with localStorage fallback
+// Database connection layer supporting Firebase Firestore & Storage with localStorage fallback
 import { 
     db, 
+    storage,
+    storageRef,
+    uploadBytes,
+    getDownloadURL,
     collection, 
     addDoc, 
     getDocs, 
@@ -11,10 +15,11 @@ import {
     query, 
     orderBy,
     deleteDoc,
-    isFirebaseConfigured 
+    isFirebaseConfigured,
+    isFirebaseStorageConfigured
 } from './firebase.js';
 
-export { isFirebaseConfigured };
+export { isFirebaseConfigured, isFirebaseStorageConfigured };
 
 // --- Firebase Status & Health Tracker ---
 let dbStatus = {
@@ -241,11 +246,17 @@ export async function loadRemoteConfig() {
             }
             const dtSnap = await getDoc(doc(db, 'config', 'desktop_data'));
             if (dtSnap.exists() && dtSnap.data()?.value) {
-                config.desktopData = dtSnap.data().value;
+                const val = dtSnap.data().value;
+                if (Array.isArray(val) && val.length > 0) {
+                    config.desktopData = val;
+                }
             }
             const mlSnap = await getDoc(doc(db, 'config', 'music_library'));
             if (mlSnap.exists() && mlSnap.data()?.value) {
-                config.musicLibrary = mlSnap.data().value;
+                const val = mlSnap.data().value;
+                if (Array.isArray(val) && val.length > 0) {
+                    config.musicLibrary = val;
+                }
             }
             if (Object.keys(config).length > 0) {
                 return config;
@@ -301,13 +312,125 @@ export function subscribeRemoteConfig(onConfigChange) {
     return () => {};
 }
 
+// --- IndexedDB Local Audio Storage (Handles audio files of any size without quota errors) ---
+const IDB_NAME = 'spiketones_media_db';
+const IDB_STORE = 'audio_tracks';
+const IDB_VERSION = 1;
+
+function openAudioDb() {
+    return new Promise((resolve) => {
+        if (typeof window === 'undefined' || !window.indexedDB) {
+            return resolve(null);
+        }
+        try {
+            const req = window.indexedDB.open(IDB_NAME, IDB_VERSION);
+            req.onupgradeneeded = (e) => {
+                const dbInstance = e.target.result;
+                if (!dbInstance.objectStoreNames.contains(IDB_STORE)) {
+                    dbInstance.createObjectStore(IDB_STORE, { keyPath: 'id' });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => resolve(null);
+        } catch (e) {
+            resolve(null);
+        }
+    });
+}
+
+export async function storeAudioInIdb(id, dataUrl) {
+    try {
+        const idb = await openAudioDb();
+        if (!idb) return false;
+        return new Promise((resolve) => {
+            const tx = idb.transaction(IDB_STORE, 'readwrite');
+            const store = tx.objectStore(IDB_STORE);
+            store.put({ id, data: dataUrl, updated: Date.now() });
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+        });
+    } catch (e) {
+        return false;
+    }
+}
+
+export async function getAudioFromIdb(id) {
+    try {
+        const idb = await openAudioDb();
+        if (!idb) return null;
+        return new Promise((resolve) => {
+            const tx = idb.transaction(IDB_STORE, 'readonly');
+            const store = tx.objectStore(IDB_STORE);
+            const req = store.get(id);
+            req.onsuccess = () => resolve(req.result?.data || null);
+            req.onerror = () => resolve(null);
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+// Upload large audio track (up to 10MB+) directly to Cloud Storage for Firebase
+export async function uploadTrackToCloudStorage(fileOrBlob, filename) {
+    if (!isFirebaseStorageConfigured() || !storage) {
+        return null;
+    }
+    try {
+        const safeName = (filename || 'track.mp3').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const trackPath = `audio_tracks/${Date.now()}_${safeName}`;
+        const fileRef = storageRef(storage, trackPath);
+        const snapshot = await uploadBytes(fileRef, fileOrBlob);
+        const downloadUrl = await getDownloadURL(snapshot.ref);
+        console.log("Successfully uploaded track to Firebase Cloud Storage:", downloadUrl);
+        return downloadUrl;
+    } catch (err) {
+        console.warn("Firebase Storage upload not available or permission denied (using local IndexedDB):", err);
+        return null;
+    }
+}
+
+// Strip heavy base64 strings from remote Firestore docs so they don't exceed the 1MB Firestore limit
+function sanitizeMusicForCloud(library) {
+    if (!Array.isArray(library)) return [];
+    return library.map(item => {
+        if (!item || typeof item !== 'object') return item;
+        const copy = { ...item };
+        if (typeof copy.src === 'string' && copy.src.startsWith('data:audio') && copy.src.length > 200000) {
+            copy.src = copy.id ? `indexeddb:${copy.id}` : 'files/music/song1.mp3';
+            copy.isLocalUpload = true;
+        }
+        return copy;
+    });
+}
+
+function sanitizeDesktopForCloud(data) {
+    if (!Array.isArray(data)) return [];
+    return data.map(item => {
+        if (!item || typeof item !== 'object') return item;
+        const copy = { ...item };
+        if (Array.isArray(copy.content)) {
+            copy.content = copy.content.map(subItem => {
+                if (!subItem || typeof subItem !== 'object') return subItem;
+                const subCopy = { ...subItem };
+                if (typeof subCopy.src === 'string' && subCopy.src.startsWith('data:audio') && subCopy.src.length > 200000) {
+                    subCopy.src = subCopy.id ? `indexeddb:${subCopy.id}` : 'files/music/song1.mp3';
+                    subCopy.isLocalUpload = true;
+                }
+                return subCopy;
+            });
+        }
+        return copy;
+    });
+}
+
 // Save Desktop Data
 export async function saveDesktopData(data) {
     let savedToFirestore = false;
+    const cloudPayload = sanitizeDesktopForCloud(data);
     if (isFirebaseConfigured() && db) {
         try {
             await setDoc(doc(db, 'config', 'desktop_data'), { 
-                value: data,
+                value: cloudPayload,
                 updated_at: new Date().toISOString()
             }, { merge: true });
             savedToFirestore = true;
@@ -317,8 +440,10 @@ export async function saveDesktopData(data) {
         }
     }
     try { 
-        localStorage.setItem('st_desktop_data', JSON.stringify(data)); 
-    } catch(e) {}
+        localStorage.setItem('st_desktop_data', JSON.stringify(cloudPayload)); 
+    } catch(e) {
+        console.warn("localStorage quota reached for desktop data:", e);
+    }
     return { success: true, firestore: savedToFirestore };
 }
 
@@ -346,10 +471,11 @@ export async function saveWallpaper(url) {
 // Save Music Library
 export async function saveMusicLibrary(library) {
     let savedToFirestore = false;
+    const cloudPayload = sanitizeMusicForCloud(library);
     if (isFirebaseConfigured() && db) {
         try {
             await setDoc(doc(db, 'config', 'music_library'), { 
-                value: library,
+                value: cloudPayload,
                 updated_at: new Date().toISOString()
             }, { merge: true });
             savedToFirestore = true;
@@ -359,8 +485,10 @@ export async function saveMusicLibrary(library) {
         }
     }
     try { 
-        localStorage.setItem('st_music_library', JSON.stringify(library)); 
-    } catch(e) {}
+        localStorage.setItem('st_music_library', JSON.stringify(cloudPayload)); 
+    } catch(e) {
+        console.warn("localStorage quota reached for music library:", e);
+    }
     return { success: true, firestore: savedToFirestore };
 }
 
@@ -390,13 +518,39 @@ export function loadLocalOverrides() {
     const result = {};
     try {
         const d = localStorage.getItem('st_desktop_data');
-        if (d) result.desktopData = JSON.parse(d);
+        if (d) {
+            const parsed = JSON.parse(d);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                result.desktopData = parsed;
+            }
+        }
         const w = localStorage.getItem('st_wallpaper');
-        if (w) result.wallpaper = w;
+        if (w && typeof w === 'string') result.wallpaper = w;
         const m = localStorage.getItem('st_music_library');
-        if (m) result.musicLibrary = JSON.parse(m);
+        if (m) {
+            const parsed = JSON.parse(m);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                result.musicLibrary = parsed;
+            }
+        }
         const p = localStorage.getItem('st_pinned_windows');
-        if (p) result.pinnedWindows = JSON.parse(p);
-    } catch(e) {}
+        if (p) {
+            const parsed = JSON.parse(p);
+            if (parsed && typeof parsed === 'object') {
+                result.pinnedWindows = parsed;
+            }
+        }
+    } catch(e) {
+        console.warn("Failed parsing local overrides cache:", e);
+    }
     return result;
+}
+
+export function clearCorruptedLocalCache() {
+    try {
+        localStorage.removeItem('st_desktop_data');
+        localStorage.removeItem('st_music_library');
+        localStorage.removeItem('st_pinned_windows');
+        console.log("OS local storage cache reset successfully.");
+    } catch(e) {}
 }

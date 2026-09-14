@@ -11,14 +11,78 @@ import {
     loadRemoteConfig,
     subscribeRemoteConfig,
     loadLocalOverrides,
+    clearCorruptedLocalCache,
+    storeAudioInIdb,
+    getAudioFromIdb,
+    uploadTrackToCloudStorage,
     isFirebaseConfigured,
+    isFirebaseStorageConfigured,
     subscribeFirebaseStatus,
     pingFirebase
 } from './database.js';
 
+// In-memory audio data URL cache for fast playback
+const audioDataMemoryCache = {};
+
+// Helper to resolve actual audio source (handling IndexedDB tracks)
+async function loadTrackSource(track) {
+    if (!track) return "files/music/song1.mp3";
+    if (track.src && track.src.startsWith("indexeddb:")) {
+        const id = track.id || track.src.replace("indexeddb:", "");
+        if (audioDataMemoryCache[id]) return audioDataMemoryCache[id];
+        try {
+            const idbData = await getAudioFromIdb(id);
+            if (idbData) {
+                audioDataMemoryCache[id] = idbData;
+                return idbData;
+            }
+        } catch (e) {}
+        return "files/music/song1.mp3";
+    }
+    return track.src || "files/music/song1.mp3";
+}
+
+// Ensure music library is always valid, normalized, and merges songs added in GitHub filesystem.js
+export function sanitizeMusicLibrary(lib) {
+    if (!Array.isArray(lib)) lib = [];
+    
+    // 1. Normalize existing items
+    const normalized = lib
+        .filter(t => t && typeof t === 'object')
+        .map((t, idx) => ({
+            title: t.title || t.name || `Track ${idx + 1}`,
+            artist: t.artist || "Unknown Artist",
+            src: t.src || t.url || t.file || (musicLibrary[idx % (musicLibrary.length || 1)]?.src || "files/music/song1.mp3"),
+            cover: t.cover || t.customIcon || t.image || "files/cover/song1.jpg",
+            ...(t.id ? { id: t.id } : {}),
+            ...(t.isLocalUpload ? { isLocalUpload: true } : {})
+        }));
+
+    // 2. Automatically merge default songs from filesystem.js (so GitHub additions are never lost)
+    if (Array.isArray(musicLibrary)) {
+        musicLibrary.forEach(defTrack => {
+            if (!defTrack) return;
+            const alreadyExists = normalized.some(t => 
+                (t.title && defTrack.title && t.title.toLowerCase() === defTrack.title.toLowerCase()) ||
+                (t.src && defTrack.src && t.src === defTrack.src)
+            );
+            if (!alreadyExists) {
+                normalized.push({
+                    title: defTrack.title || defTrack.name || "Default Track",
+                    artist: defTrack.artist || "SPIKETONES",
+                    src: defTrack.src || "files/music/song1.mp3",
+                    cover: defTrack.cover || "files/cover/song1.jpg"
+                });
+            }
+        });
+    }
+
+    return normalized.length > 0 ? normalized : [...musicLibrary];
+}
+
 // --- State Variables ---
 let currentDesktopData = [...desktopData];
-let currentMusicLibrary = [...musicLibrary];
+let currentMusicLibrary = sanitizeMusicLibrary([...musicLibrary]);
 let currentWallpaper = "wall.png";
 let currentUser = localStorage.getItem("currentUser") || "guest";
 let isOwner = currentUser === "admin";
@@ -39,22 +103,34 @@ let isPlaying = false;
 let audio = new Audio();
 audio.crossOrigin = "anonymous";
 
-// Ensure CANCUN is selected first to match initial track
-const cancunIdx = currentMusicLibrary.findIndex(t => t.title.toUpperCase().includes('CANCUN'));
-if (cancunIdx !== -1) {
-    currentTrackIndex = cancunIdx;
+// Initial local overrides fallback before remote fetch
+try {
+    const initialOverrides = loadLocalOverrides();
+    if (initialOverrides.desktopData && Array.isArray(initialOverrides.desktopData)) {
+        currentDesktopData = initialOverrides.desktopData;
+    }
+    if (initialOverrides.wallpaper) {
+        currentWallpaper = initialOverrides.wallpaper;
+        document.body.style.backgroundImage = `url('${currentWallpaper}')`;
+        const lockBg = document.getElementById("lock-screen-bg");
+        if (lockBg) lockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+    }
+    if (initialOverrides.musicLibrary && Array.isArray(initialOverrides.musicLibrary)) {
+        currentMusicLibrary = sanitizeMusicLibrary(initialOverrides.musicLibrary);
+    }
+} catch (e) {
+    console.warn("Failed reading local overrides; using defaults:", e);
 }
 
-// Initial local overrides fallback before remote fetch
-const initialOverrides = loadLocalOverrides();
-if (initialOverrides.desktopData) currentDesktopData = initialOverrides.desktopData;
-if (initialOverrides.wallpaper) {
-    currentWallpaper = initialOverrides.wallpaper;
-    document.body.style.backgroundImage = `url('${currentWallpaper}')`;
-    const lockBg = document.getElementById("lock-screen-bg");
-    if (lockBg) lockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+// Select CANCUN safely if available
+const cancunIdx = currentMusicLibrary.findIndex(t => 
+    t && (t.title || t.name) && String(t.title || t.name).toUpperCase().includes('CANCUN')
+);
+if (cancunIdx !== -1) {
+    currentTrackIndex = cancunIdx;
+} else {
+    currentTrackIndex = 0;
 }
-if (initialOverrides.musicLibrary) currentMusicLibrary = initialOverrides.musicLibrary;
 
 // Helper to set wallpaper synchronously across desktop and lock screen
 export function setWallpaper(url) {
@@ -75,6 +151,7 @@ function sanitizeDesktopData(data) {
     const defaultMusic = desktopData.find(d => d.name === "Music");
 
     const result = data.map(item => {
+        if (!item || typeof item !== 'object') return item;
         if (item.name === "Socials") {
             if (!item.content || item.content.length === 0) {
                 return { ...item, content: [...(defaultSocials ? defaultSocials.content : [])] };
@@ -88,6 +165,18 @@ function sanitizeDesktopData(data) {
         if (item.name === "Music") {
             if (!item.content || item.content.length === 0) {
                 return { ...item, content: [...(defaultMusic ? defaultMusic.content : [])] };
+            }
+            // Merge in any default music items from filesystem.js that aren't yet in this folder
+            if (defaultMusic && Array.isArray(defaultMusic.content)) {
+                defaultMusic.content.forEach(defM => {
+                    const exists = item.content.some(m => 
+                        (m.name && defM.name && m.name.toLowerCase() === defM.name.toLowerCase()) ||
+                        (m.src && defM.src && m.src === defM.src)
+                    );
+                    if (!exists) {
+                        item.content.push({ ...defM });
+                    }
+                });
             }
         }
         return item;
@@ -2397,73 +2486,109 @@ function updateTaskbar() {
 
 // --- HDD Mini Player ---
 function initHDDPlayer() {
-    const existing = document.getElementById("hdd-mini-player");
-    if (existing) return;
+    try {
+        const existing = document.getElementById("hdd-mini-player");
+        if (existing) return;
 
-    const track = currentMusicLibrary[currentTrackIndex] || currentMusicLibrary[0];
-    const playerDiv = document.createElement("div");
-    playerDiv.id = "hdd-mini-player";
-    playerDiv.innerHTML = `
-        <div class="hdd-base">
-            <img src="${track.cover}" class="hdd-platter" id="hdd-cover" alt="Cover" />
-        </div>
-        <div class="hdd-info" id="hdd-track-name">${escapeHTML(track.title)}</div>
-        <div class="hdd-controls">
-            <button class="hdd-btn" id="hdd-prev-btn" title="Previous">⏮</button>
-            <button class="hdd-btn" id="hdd-play-btn" title="Play">▶</button>
-            <button class="hdd-btn" id="hdd-next-btn" title="Next">⏭</button>
-        </div>
-    `;
+        currentMusicLibrary = sanitizeMusicLibrary(currentMusicLibrary);
+        if (currentTrackIndex < 0 || currentTrackIndex >= currentMusicLibrary.length) {
+            currentTrackIndex = 0;
+        }
 
-    document.getElementById("desktop").appendChild(playerDiv);
-
-    // Dragging support for HDD player
-    let isDragging = false;
-    let startX = 0, startY = 0, initLeft = 0, initTop = 0;
-
-    playerDiv.addEventListener("mousedown", (e) => {
-        if (e.target.closest(".hdd-controls")) return;
-        isDragging = true;
-        const rect = playerDiv.getBoundingClientRect();
-        startX = e.clientX;
-        startY = e.clientY;
-        initLeft = rect.left;
-        initTop = rect.top;
-
-        const onMove = (ev) => {
-            if (!isDragging) return;
-            playerDiv.style.left = `${initLeft + (ev.clientX - startX)}px`;
-            playerDiv.style.top = `${initTop + (ev.clientY - startY)}px`;
-            playerDiv.style.right = "auto";
+        const track = currentMusicLibrary[currentTrackIndex] || currentMusicLibrary[0] || {
+            title: "Too Many Nights",
+            artist: "Metro Boomin",
+            src: "files/music/song1.mp3",
+            cover: "files/cover/song1.jpg"
         };
 
-        const onUp = () => {
-            isDragging = false;
-            document.removeEventListener("mousemove", onMove);
-            document.removeEventListener("mouseup", onUp);
-        };
+        const playerDiv = document.createElement("div");
+        playerDiv.id = "hdd-mini-player";
+        playerDiv.innerHTML = `
+            <div class="hdd-base">
+                <img src="${track.cover || 'files/cover/song1.jpg'}" class="hdd-platter" id="hdd-cover" alt="Cover" />
+            </div>
+            <div class="hdd-info" id="hdd-track-name">${escapeHTML(track.title || 'Unknown Track')}</div>
+            <div class="hdd-controls">
+                <button class="hdd-btn" id="hdd-prev-btn" title="Previous">⏮</button>
+                <button class="hdd-btn" id="hdd-play-btn" title="Play">▶</button>
+                <button class="hdd-btn" id="hdd-next-btn" title="Next">⏭</button>
+            </div>
+        `;
 
-        document.addEventListener("mousemove", onMove);
-        document.addEventListener("mouseup", onUp);
-    });
+        const desktop = document.getElementById("desktop");
+        if (desktop) {
+            desktop.appendChild(playerDiv);
+        } else {
+            document.body.appendChild(playerDiv);
+        }
 
-    document.getElementById("hdd-play-btn").addEventListener("click", togglePlay);
-    document.getElementById("hdd-prev-btn").addEventListener("click", prevTrack);
-    document.getElementById("hdd-next-btn").addEventListener("click", nextTrack);
+        // Dragging support for HDD player
+        let isDragging = false;
+        let startX = 0, startY = 0, initLeft = 0, initTop = 0;
 
-    audio.addEventListener("ended", nextTrack);
+        playerDiv.addEventListener("mousedown", (e) => {
+            if (e.target.closest(".hdd-controls")) return;
+            isDragging = true;
+            const rect = playerDiv.getBoundingClientRect();
+            startX = e.clientX;
+            startY = e.clientY;
+            initLeft = rect.left;
+            initTop = rect.top;
+
+            const onMove = (ev) => {
+                if (!isDragging) return;
+                playerDiv.style.left = `${initLeft + (ev.clientX - startX)}px`;
+                playerDiv.style.top = `${initTop + (ev.clientY - startY)}px`;
+                playerDiv.style.right = "auto";
+            };
+
+            const onUp = () => {
+                isDragging = false;
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup", onUp);
+            };
+
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        });
+
+        const playBtn = document.getElementById("hdd-play-btn");
+        const prevBtn = document.getElementById("hdd-prev-btn");
+        const nextBtn = document.getElementById("hdd-next-btn");
+
+        if (playBtn) playBtn.addEventListener("click", togglePlay);
+        if (prevBtn) prevBtn.addEventListener("click", prevTrack);
+        if (nextBtn) nextBtn.addEventListener("click", nextTrack);
+
+        audio.addEventListener("ended", nextTrack);
+        audio.addEventListener("error", (err) => {
+            console.warn("Audio playback issue with current track:", err);
+            isPlaying = false;
+            updateHDDUI();
+        });
+    } catch (e) {
+        console.error("Error initializing HDD Mini Player:", e);
+    }
 }
 
 function updateHDDUI() {
-    const track = currentMusicLibrary[currentTrackIndex];
+    if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) {
+        currentMusicLibrary = sanitizeMusicLibrary([]);
+    }
+    if (currentTrackIndex < 0 || currentTrackIndex >= currentMusicLibrary.length) {
+        currentTrackIndex = 0;
+    }
+    const track = currentMusicLibrary[currentTrackIndex] || currentMusicLibrary[0];
     if (!track) return;
+
     const cover = document.getElementById("hdd-cover");
     const title = document.getElementById("hdd-track-name");
     const playBtn = document.getElementById("hdd-play-btn");
     const playerDiv = document.getElementById("hdd-mini-player");
 
-    if (cover) cover.src = track.cover;
-    if (title) title.textContent = track.title;
+    if (cover) cover.src = track.cover || "files/cover/song1.jpg";
+    if (title) title.textContent = track.title || "Unknown Track";
     if (playBtn) playBtn.textContent = isPlaying ? "⏸" : "▶";
     if (playerDiv) {
         if (isPlaying) playerDiv.classList.add("playing");
@@ -2471,12 +2596,20 @@ function updateHDDUI() {
     }
 }
 
-function togglePlay() {
+async function togglePlay() {
+    if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) {
+        currentMusicLibrary = sanitizeMusicLibrary([]);
+    }
+    if (currentTrackIndex < 0 || currentTrackIndex >= currentMusicLibrary.length) {
+        currentTrackIndex = 0;
+    }
     const track = currentMusicLibrary[currentTrackIndex];
     if (!track) return;
 
-    if (!audio.src || !audio.src.includes(track.src)) {
-        audio.src = track.src;
+    const actualSrc = await loadTrackSource(track);
+
+    if (!audio.src || !audio.src.includes(actualSrc)) {
+        audio.src = actualSrc;
     }
 
     if (isPlaying) {
@@ -2491,28 +2624,40 @@ function togglePlay() {
     updateHDDUI();
 }
 
-function nextTrack() {
+async function nextTrack() {
+    if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) return;
     currentTrackIndex = (currentTrackIndex + 1) % currentMusicLibrary.length;
     const track = currentMusicLibrary[currentTrackIndex];
-    audio.src = track.src;
+    if (!track) return;
+
+    const actualSrc = await loadTrackSource(track);
+    audio.src = actualSrc;
     if (isPlaying) audio.play().catch(() => {});
     updateHDDUI();
 }
 
-function prevTrack() {
+async function prevTrack() {
+    if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) return;
     currentTrackIndex = (currentTrackIndex - 1 + currentMusicLibrary.length) % currentMusicLibrary.length;
     const track = currentMusicLibrary[currentTrackIndex];
-    audio.src = track.src;
+    if (!track) return;
+
+    const actualSrc = await loadTrackSource(track);
+    audio.src = actualSrc;
     if (isPlaying) audio.play().catch(() => {});
     updateHDDUI();
 }
 
-function playTrackBySrc(src, name) {
-    const idx = currentMusicLibrary.findIndex(m => m.src === src || m.title === name);
+async function playTrackBySrc(src, name) {
+    if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) {
+        currentMusicLibrary = sanitizeMusicLibrary([]);
+    }
+    const idx = currentMusicLibrary.findIndex(m => m && (m.src === src || m.title === name || m.name === name));
     if (idx !== -1) {
         currentTrackIndex = idx;
         const track = currentMusicLibrary[currentTrackIndex];
-        audio.src = track.src;
+        const actualSrc = await loadTrackSource(track);
+        audio.src = actualSrc;
         audio.play().catch(() => {});
         isPlaying = true;
         updateHDDUI();
@@ -2747,6 +2892,7 @@ export function powerAction(action) {
         const overlay = document.getElementById("sleep-overlay");
         if (overlay) overlay.classList.add("active");
     } else if (action === "restart") {
+        clearCorruptedLocalCache();
         window.location.reload();
     }
 }
@@ -3483,44 +3629,72 @@ function setupUploaders() {
 }
 
 function handleFilesUpload(files, targetFolder = null) {
-    files.forEach(file => {
+    files.forEach(async (file) => {
         const isAudio = file.type.startsWith("audio/") || file.name.match(/\.(mp3|wav|ogg|m4a|aac|flac)$/i);
         const isImage = file.type.startsWith("image/") || file.name.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i);
         
         if (isAudio) {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                const dataUrl = ev.target.result;
-                const cleanName = file.name.replace(/\.[^/.]+$/, "");
-                const musicItem = {
-                    name: cleanName,
-                    type: "music",
-                    src: dataUrl,
-                    customIcon: "fluent:music-note-2-24-filled"
-                };
-                
-                if (targetFolder) {
-                    if (!targetFolder.content) targetFolder.content = [];
-                    targetFolder.content.push(musicItem);
-                    openFolderWindow(targetFolder);
-                } else {
-                    currentDesktopData.push(musicItem);
-                    renderDesktop();
+            const cleanName = file.name.replace(/\.[^/.]+$/, "");
+            const trackId = `track_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+            
+            showToast(`Uploading audio track "${cleanName}"...`);
+            
+            let trackSrc = `indexeddb:${trackId}`;
+            let isCloud = false;
+
+            // Attempt upload directly to Firebase Cloud Storage (bypasses all 1MB limits)
+            try {
+                const cloudUrl = await uploadTrackToCloudStorage(file, file.name);
+                if (cloudUrl) {
+                    trackSrc = cloudUrl;
+                    isCloud = true;
                 }
-                
-                currentMusicLibrary.push({
-                    title: cleanName,
-                    artist: "Local Track",
-                    src: dataUrl,
-                    cover: "files/cover/song1.jpg"
+            } catch (uErr) {
+                console.warn("Direct storage upload failed, falling back to local:", uErr);
+            }
+
+            if (!isCloud) {
+                // Fallback to high-capacity local IndexedDB
+                const reader = new FileReader();
+                const dataUrl = await new Promise((resolve) => {
+                    reader.onload = (ev) => resolve(ev.target.result);
+                    reader.readAsDataURL(file);
                 });
-                
-                saveMusicLibrary(currentMusicLibrary);
-                saveDesktopData(currentDesktopData);
-                showToast(`Uploaded song "${cleanName}" — now in Music Player!`);
-                updateHDDUI();
+                await storeAudioInIdb(trackId, dataUrl);
+                audioDataMemoryCache[trackId] = dataUrl;
+            }
+
+            const musicItem = {
+                id: trackId,
+                name: cleanName,
+                type: "music",
+                src: trackSrc,
+                customIcon: "fluent:music-note-2-24-filled",
+                isLocalUpload: !isCloud
             };
-            reader.readAsDataURL(file);
+            
+            if (targetFolder) {
+                if (!targetFolder.content) targetFolder.content = [];
+                targetFolder.content.push(musicItem);
+                openFolderWindow(targetFolder);
+            } else {
+                currentDesktopData.push(musicItem);
+                renderDesktop();
+            }
+            
+            currentMusicLibrary.push({
+                id: trackId,
+                title: cleanName,
+                artist: "Uploaded Track",
+                src: trackSrc,
+                cover: "files/cover/song1.jpg",
+                isLocalUpload: !isCloud
+            });
+            
+            await saveMusicLibrary(currentMusicLibrary);
+            await saveDesktopData(currentDesktopData);
+            showToast(isCloud ? `Uploaded "${cleanName}" to Cloud Storage!` : `Uploaded "${cleanName}" to Music Player!`);
+            updateHDDUI();
         } else if (isImage) {
             const reader = new FileReader();
             reader.onload = (ev) => {
@@ -3843,6 +4017,7 @@ function renderStickyNoteElement(note) {
 // ==========================================================================
 let selectedModalAudioDataUrl = null;
 let selectedModalAudioFileName = "";
+let selectedModalAudioRawFile = null;
 let selectedModalCoverDataUrl = "files/cover/song1.jpg";
 let currentMusicModalFolder = null;
 
@@ -3853,6 +4028,7 @@ export function openMusicUploadModal(targetFolder = null) {
 
     selectedModalAudioDataUrl = null;
     selectedModalAudioFileName = "";
+    selectedModalAudioRawFile = null;
     selectedModalCoverDataUrl = "files/cover/song1.jpg";
 
     const nameLabel = document.getElementById("modal-audio-name");
@@ -3962,6 +4138,7 @@ function setupMusicUploadModal() {
     }
 
     function loadAudioFileForModal(file) {
+        selectedModalAudioRawFile = file;
         const reader = new FileReader();
         reader.onload = (e) => {
             selectedModalAudioDataUrl = e.target.result;
@@ -4002,9 +4179,35 @@ function setupMusicUploadModal() {
                 return;
             }
 
+            const origBtnText = confirmBtn.textContent;
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = "Uploading...";
+
             const title = (titleInput && titleInput.value.trim()) || selectedModalAudioFileName.replace(/\.[^/.]+$/, "") || "Custom Track";
             const artist = (artistInput && artistInput.value.trim()) || "Unknown Artist";
             const cover = selectedModalCoverDataUrl || "files/cover/song1.jpg";
+            const trackId = `track_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+            let trackSrc = `indexeddb:${trackId}`;
+            let isCloud = false;
+
+            // Attempt upload directly to Firebase Cloud Storage (handles 10MB+ effortlessly)
+            if (selectedModalAudioRawFile) {
+                try {
+                    const cloudUrl = await uploadTrackToCloudStorage(selectedModalAudioRawFile, selectedModalAudioFileName);
+                    if (cloudUrl) {
+                        trackSrc = cloudUrl;
+                        isCloud = true;
+                    }
+                } catch (cErr) {
+                    console.warn("Storage upload failed, falling back to local IndexedDB:", cErr);
+                }
+            }
+
+            if (!isCloud) {
+                await storeAudioInIdb(trackId, selectedModalAudioDataUrl);
+                audioDataMemoryCache[trackId] = selectedModalAudioDataUrl;
+            }
 
             let musicFolder = currentMusicModalFolder;
             if (!musicFolder) {
@@ -4013,20 +4216,24 @@ function setupMusicUploadModal() {
             if (musicFolder) {
                 if (!musicFolder.content) musicFolder.content = [];
                 musicFolder.content.push({
+                    id: trackId,
                     name: title,
                     type: "music",
-                    src: selectedModalAudioDataUrl,
+                    src: trackSrc,
                     customIcon: cover,
-                    artist: artist
+                    artist: artist,
+                    isLocalUpload: !isCloud
                 });
                 openFolderWindow(musicFolder);
             }
 
             const newTrack = {
+                id: trackId,
                 title: title,
                 artist: artist,
-                src: selectedModalAudioDataUrl,
-                cover: cover
+                src: trackSrc,
+                cover: cover,
+                isLocalUpload: !isCloud
             };
             currentMusicLibrary.push(newTrack);
             currentTrackIndex = currentMusicLibrary.length - 1;
@@ -4034,11 +4241,15 @@ function setupMusicUploadModal() {
             await saveMusicLibrary(currentMusicLibrary);
             await saveDesktopData(currentDesktopData);
 
-            audio.src = selectedModalAudioDataUrl;
+            audio.src = isCloud ? trackSrc : selectedModalAudioDataUrl;
+            isPlaying = true;
+            audio.play().catch(() => {});
             updateHDDUI();
 
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = origBtnText;
             closeMusicUploadModal();
-            showToast(`Added "${title}" with custom cover!`);
+            showToast(isCloud ? `Uploaded "${title}" to Cloud Storage!` : `Added "${title}" with custom cover!`);
         });
     }
 }
@@ -4086,69 +4297,157 @@ function initFirebaseStatusWidget() {
     });
 }
 
+export function setMusicLibrary(lib) {
+    currentMusicLibrary = sanitizeMusicLibrary(lib);
+    updateHDDUI();
+}
+
+// Global emergency recovery function to clean local storage and reset to clean GitHub defaults
+window.resetSpiketonesOS = () => {
+    clearCorruptedLocalCache();
+    window.location.reload();
+};
+
 // --- Initial Boot Sequence ---
-window.addEventListener("DOMContentLoaded", () => {
-    initFirebaseStatusWidget();
-    updateUserUI();
-    renderDesktop();
-    initHDDPlayer();
-    updateClocks();
-    initContextMenu();
-    initDesktopDragSelect();
-    setupUploaders();
-    setupMusicUploadModal();
-    loadStickyNotes();
-    if (stickyNotes.length > 0) {
-        stickyNotes.forEach(n => renderStickyNoteElement(n));
-    }
-    setInterval(updateClocks, 1000);
+function bootOS() {
+    console.log("SPIKETONES007 OS Booting...");
 
-    // Initial boot to Windows 11 Guest Welcome lockscreen
-    selectLockUser("guest");
-    const initialLockBg = document.getElementById("lock-screen-bg");
-    if (initialLockBg) initialLockBg.style.backgroundImage = `url('${currentWallpaper}')`;
-    const lockScreen = document.getElementById("lock-screen");
-    if (lockScreen) {
-        lockScreen.style.display = "flex";
-        lockScreen.style.opacity = "1";
+    // 1. Firebase status monitor
+    try {
+        initFirebaseStatusWidget();
+    } catch (e) {
+        console.warn("initFirebaseStatusWidget failed:", e);
     }
 
-    // Open Socials window matching screenshot layout
-    const socialsItem = currentDesktopData.find(d => d.name === "Socials");
-    if (socialsItem) {
-        openFolderWindow(socialsItem);
+    // 2. User permissions and UI styling
+    try {
+        updateUserUI();
+    } catch (e) {
+        console.warn("updateUserUI failed:", e);
     }
 
-    // Open Guestbook panel docked at bottom-right matching screenshot layout
-    openGuestbook();
+    // 3. Desktop icons
+    try {
+        renderDesktop();
+    } catch (e) {
+        console.error("renderDesktop failed:", e);
+    }
 
-    // Check & synchronize with remote Firebase Firestore config
-    loadRemoteConfig().then(config => {
-        if (config.wallpaper && config.wallpaper !== currentWallpaper) {
-            currentWallpaper = config.wallpaper;
-            document.body.style.backgroundImage = `url('${currentWallpaper}')`;
-        }
-        if (config.desktopData && Array.isArray(config.desktopData)) {
-            currentDesktopData = config.desktopData;
-            renderDesktop();
-        }
-        if (config.musicLibrary && Array.isArray(config.musicLibrary)) {
-            currentMusicLibrary = config.musicLibrary;
-            updateHDDUI();
-        }
-    });
+    // 4. HDD Mini Player
+    try {
+        initHDDPlayer();
+    } catch (e) {
+        console.error("initHDDPlayer failed:", e);
+    }
 
-    // Real-time synchronization for changes made by owner
-    subscribeRemoteConfig((key, value) => {
-        if (key === 'wallpaper' && value) {
-            currentWallpaper = value;
-            document.body.style.backgroundImage = `url('${currentWallpaper}')`;
-        } else if (key === 'desktopData' && Array.isArray(value)) {
-            currentDesktopData = value;
-            renderDesktop();
-        } else if (key === 'musicLibrary' && Array.isArray(value)) {
-            currentMusicLibrary = value;
-            updateHDDUI();
+    // 5. System and Mond Clocks
+    try {
+        updateClocks();
+        setInterval(updateClocks, 1000);
+    } catch (e) {
+        console.warn("updateClocks failed:", e);
+    }
+
+    // 6. Interactive features
+    try {
+        initContextMenu();
+    } catch (e) {
+        console.warn("initContextMenu failed:", e);
+    }
+    try {
+        initDesktopDragSelect();
+    } catch (e) {
+        console.warn("initDesktopDragSelect failed:", e);
+    }
+    try {
+        setupUploaders();
+    } catch (e) {
+        console.warn("setupUploaders failed:", e);
+    }
+    try {
+        setupMusicUploadModal();
+    } catch (e) {
+        console.warn("setupMusicUploadModal failed:", e);
+    }
+
+    // 7. Sticky Notes
+    try {
+        loadStickyNotes();
+        if (stickyNotes.length > 0) {
+            stickyNotes.forEach(n => renderStickyNoteElement(n));
         }
-    });
-});
+    } catch (e) {
+        console.warn("loadStickyNotes failed:", e);
+    }
+
+    // 8. Initial boot to Windows 11 Guest Welcome lockscreen
+    try {
+        selectLockUser("guest");
+        const initialLockBg = document.getElementById("lock-screen-bg");
+        if (initialLockBg) initialLockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+        const lockScreen = document.getElementById("lock-screen");
+        if (lockScreen) {
+            lockScreen.style.display = "flex";
+            lockScreen.style.opacity = "1";
+        }
+    } catch (e) {
+        console.error("Lockscreen initialization failed:", e);
+    }
+
+    // 9. Open Socials window matching screenshot layout
+    try {
+        const socialsItem = findFolderItem("Socials") || currentDesktopData.find(d => d.type === "folder");
+        if (socialsItem) {
+            openFolderWindow(socialsItem);
+        }
+    } catch (e) {
+        console.error("Failed opening default Socials folder:", e);
+    }
+
+    // 10. Open Guestbook panel docked at bottom-right matching screenshot layout
+    try {
+        openGuestbook();
+    } catch (e) {
+        console.error("Failed opening default Guestbook window:", e);
+    }
+
+    // 11. Check & synchronize with remote Firebase Firestore config
+    try {
+        loadRemoteConfig().then(config => {
+            if (config.wallpaper && config.wallpaper !== currentWallpaper) {
+                setWallpaper(config.wallpaper);
+            }
+            if (config.desktopData && Array.isArray(config.desktopData) && config.desktopData.length > 0) {
+                currentDesktopData = sanitizeDesktopData(config.desktopData);
+                renderDesktop();
+            }
+            if (config.musicLibrary && Array.isArray(config.musicLibrary) && config.musicLibrary.length > 0) {
+                setMusicLibrary(config.musicLibrary);
+                updateHDDUI();
+            }
+        }).catch(err => {
+            console.warn("Firebase remote config load warning:", err);
+        });
+
+        // Real-time synchronization for changes made by owner
+        subscribeRemoteConfig((key, value) => {
+            if (key === 'wallpaper' && value) {
+                setWallpaper(value);
+            } else if (key === 'desktopData' && Array.isArray(value) && value.length > 0) {
+                currentDesktopData = sanitizeDesktopData(value);
+                renderDesktop();
+            } else if (key === 'musicLibrary' && Array.isArray(value) && value.length > 0) {
+                setMusicLibrary(value);
+                updateHDDUI();
+            }
+        });
+    } catch (e) {
+        console.warn("Firebase config subscription warning:", e);
+    }
+}
+
+if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", bootOS);
+} else {
+    bootOS();
+}
