@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SPIKETONES007 OS</title>
+    <title>SPIKETONES007</title>
     <meta name="description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
     <meta property="og:title" content="SPIKETONES007 OS" />
     <meta property="og:description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
@@ -16,7 +16,7 @@
     <div id="sleep-overlay" class="sleep-overlay" onclick="wakeUp()"></div>
 
     <!-- Windows 11 Lock / Login Screen -->
-    <div id="lock-screen" class="lock-screen" style="display: none;">
+    <div id="lock-screen" class="lock-screen">
         <div class="lock-screen-bg" id="lock-screen-bg"></div>
         <div class="lock-screen-content">
             <div class="lock-avatar-circle">
@@ -25,18 +25,18 @@
                     <path d="M4 20c0-4 4-6.5 8-6.5s8 2.5 8 6.5"></path>
                 </svg>
             </div>
-            <div class="lock-user-name" id="lock-user-name">SPIKETONES007</div>
+            <div class="lock-user-name" id="lock-user-name">Guest</div>
             
-            <form id="lock-form" class="lock-form" onsubmit="window.handleLockSubmit(event)">
+            <form id="lock-form" class="lock-form" style="display: none;" onsubmit="window.handleLockSubmit(event)">
                 <div class="lock-input-wrap">
-                    <input type="password" id="lock-pin-input" class="lock-pin-input" placeholder="Password" autocomplete="off" spellcheck="false" autofocus />
+                    <input type="password" id="lock-pin-input" class="lock-pin-input" placeholder="Password" autocomplete="off" spellcheck="false" />
                     <button type="submit" class="lock-submit-btn" id="lock-submit-btn" title="Sign In">➔</button>
                 </div>
                 <div class="lock-error-msg" id="lock-error-msg"></div>
             </form>
 
-            <div id="lock-guest-wrap" class="lock-guest-wrap" style="display: none;">
-                <button type="button" class="lock-welcome-btn" id="lock-welcome-btn" onclick="window.submitGuestWelcome()">
+            <div id="lock-guest-wrap" class="lock-guest-wrap">
+                <button type="button" class="lock-welcome-btn" id="lock-welcome-btn" onclick="window.submitGuestWelcome()" autofocus>
                     <span class="welcome-btn-text" id="welcome-btn-text">Welcome</span>
                     <div class="win-ring-spinner" id="welcome-spinner" style="display: none;"></div>
                 </button>
@@ -45,7 +45,7 @@
 
         <!-- Lock Screen Bottom Left: User Switcher -->
         <div class="lock-bottom-left">
-            <div class="lock-user-tile active" id="lock-tile-admin" onclick="window.selectLockUser('admin')">
+            <div class="lock-user-tile" id="lock-tile-admin" onclick="window.selectLockUser('admin')">
                 <div class="lock-tile-icon">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
@@ -54,7 +54,7 @@
                 </div>
                 <span>SPIKETONES007</span>
             </div>
-            <div class="lock-user-tile" id="lock-tile-guest" onclick="window.selectLockUser('guest')">
+            <div class="lock-user-tile active" id="lock-tile-guest" onclick="window.selectLockUser('guest')">
                 <div class="lock-tile-icon">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="7" r="4"></circle>

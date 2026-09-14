@@ -1751,36 +1751,40 @@ body.user-admin .start-menu {
 .lock-welcome-btn {
     min-width: 148px;
     height: 34px;
-    background: rgba(255, 255, 255, 0.12);
-    border: 1px solid rgba(255, 255, 255, 0.35);
-    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.14);
+    border: 1.5px solid #0078d4;
+    border-radius: 4px;
     color: #ffffff;
-    font-size: 13px;
-    font-weight: 400;
+    font-size: 13.5px;
+    font-weight: 500;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 10px;
-    padding: 0 24px;
-    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    padding: 0 28px;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
     outline: none;
     user-select: none;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
 }
 
 .lock-welcome-btn:hover {
-    background: rgba(255, 255, 255, 0.22);
-    border-color: rgba(255, 255, 255, 0.55);
+    background: rgba(255, 255, 255, 0.24);
+    border-color: #2b88d8;
+    box-shadow: 0 3px 14px rgba(0, 120, 212, 0.35);
 }
 
 .lock-welcome-btn:focus-visible {
-    border-color: #0078d4;
-    outline: 2px solid rgba(0, 120, 212, 0.6);
+    border-color: #4da6ff;
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(0, 120, 212, 0.6);
 }
 
 .lock-welcome-btn:active {
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.18);
     transform: scale(0.98);
 }
 

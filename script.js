@@ -139,7 +139,7 @@ export async function setAdminPassword(newPin) {
     return hash;
 }
 
-let currentLockSelectedUser = "admin";
+let currentLockSelectedUser = "guest";
 
 export function lockSystem() {
     const lockScreen = document.getElementById("lock-screen");
@@ -4102,6 +4102,16 @@ window.addEventListener("DOMContentLoaded", () => {
         stickyNotes.forEach(n => renderStickyNoteElement(n));
     }
     setInterval(updateClocks, 1000);
+
+    // Initial boot to Windows 11 Guest Welcome lockscreen
+    selectLockUser("guest");
+    const initialLockBg = document.getElementById("lock-screen-bg");
+    if (initialLockBg) initialLockBg.style.backgroundImage = `url('${currentWallpaper}')`;
+    const lockScreen = document.getElementById("lock-screen");
+    if (lockScreen) {
+        lockScreen.style.display = "flex";
+        lockScreen.style.opacity = "1";
+    }
 
     // Open Socials window matching screenshot layout
     const socialsItem = currentDesktopData.find(d => d.name === "Socials");
