@@ -245,18 +245,22 @@ export async function loadRemoteConfig() {
                 config.wallpaper = wpSnap.data().value;
             }
             const dtSnap = await getDoc(doc(db, 'config', 'desktop_data'));
-            if (dtSnap.exists() && dtSnap.data()?.value) {
+            if (dtSnap.exists() && dtSnap.data()?.value !== undefined) {
                 const val = dtSnap.data().value;
-                if (Array.isArray(val) && val.length > 0) {
+                if (Array.isArray(val)) {
                     config.desktopData = val;
                 }
             }
             const mlSnap = await getDoc(doc(db, 'config', 'music_library'));
-            if (mlSnap.exists() && mlSnap.data()?.value) {
+            if (mlSnap.exists() && mlSnap.data()?.value !== undefined) {
                 const val = mlSnap.data().value;
-                if (Array.isArray(val) && val.length > 0) {
+                if (Array.isArray(val)) {
                     config.musicLibrary = val;
                 }
+            }
+            const csSnap = await getDoc(doc(db, 'config', 'cs2_config'));
+            if (csSnap.exists() && csSnap.data()) {
+                config.cs2Config = csSnap.data();
             }
             if (Object.keys(config).length > 0) {
                 return config;
@@ -279,14 +283,14 @@ export function subscribeRemoteConfig(onConfigChange) {
                 console.warn("Wallpaper snapshot listener inactive:", err?.message || err);
             });
             const unsubDt = onSnapshot(doc(db, 'config', 'desktop_data'), (snap) => {
-                if (snap.exists() && snap.data()?.value) {
+                if (snap.exists() && snap.data()?.value !== undefined) {
                     onConfigChange('desktopData', snap.data().value);
                 }
             }, (err) => {
                 console.warn("Desktop data snapshot listener inactive:", err?.message || err);
             });
             const unsubMl = onSnapshot(doc(db, 'config', 'music_library'), (snap) => {
-                if (snap.exists() && snap.data()?.value) {
+                if (snap.exists() && snap.data()?.value !== undefined) {
                     onConfigChange('musicLibrary', snap.data().value);
                 }
             }, (err) => {
@@ -299,11 +303,19 @@ export function subscribeRemoteConfig(onConfigChange) {
             }, (err) => {
                 console.warn("Pinned windows snapshot listener inactive:", err?.message || err);
             });
+            const unsubCs = onSnapshot(doc(db, 'config', 'cs2_config'), (snap) => {
+                if (snap.exists() && snap.data()) {
+                    onConfigChange('cs2Config', snap.data());
+                }
+            }, (err) => {
+                console.warn("CS2 config snapshot listener inactive:", err?.message || err);
+            });
             return () => {
                 if (unsubWp) unsubWp();
                 if (unsubDt) unsubDt();
                 if (unsubMl) unsubMl();
                 if (unsubPw) unsubPw();
+                if (unsubCs) unsubCs();
             };
         } catch (e) {
             console.warn("Remote config subscription warning:", e);
@@ -513,6 +525,27 @@ export async function savePinnedWindows(pinned) {
     return { success: true, firestore: savedToFirestore };
 }
 
+// Save CS2 Config (Video URL, Leetify Profile URL, Stats)
+export async function saveCs2Config(cs2Config) {
+    let savedToFirestore = false;
+    if (isFirebaseConfigured() && db) {
+        try {
+            await setDoc(doc(db, 'config', 'cs2_config'), {
+                ...cs2Config,
+                updated_at: new Date().toISOString()
+            }, { merge: true });
+            savedToFirestore = true;
+            recordDbUpdate();
+        } catch (err) {
+            console.warn("Firebase saveCs2Config error (saving locally):", err);
+        }
+    }
+    try {
+        localStorage.setItem('st_cs2_config', JSON.stringify(cs2Config));
+    } catch(e) {}
+    return { success: true, firestore: savedToFirestore };
+}
+
 // Load local overrides
 export function loadLocalOverrides() {
     const result = {};
@@ -520,7 +553,7 @@ export function loadLocalOverrides() {
         const d = localStorage.getItem('st_desktop_data');
         if (d) {
             const parsed = JSON.parse(d);
-            if (Array.isArray(parsed) && parsed.length > 0) {
+            if (Array.isArray(parsed)) {
                 result.desktopData = parsed;
             }
         }
@@ -529,7 +562,7 @@ export function loadLocalOverrides() {
         const m = localStorage.getItem('st_music_library');
         if (m) {
             const parsed = JSON.parse(m);
-            if (Array.isArray(parsed) && parsed.length > 0) {
+            if (Array.isArray(parsed)) {
                 result.musicLibrary = parsed;
             }
         }
@@ -538,6 +571,13 @@ export function loadLocalOverrides() {
             const parsed = JSON.parse(p);
             if (parsed && typeof parsed === 'object') {
                 result.pinnedWindows = parsed;
+            }
+        }
+        const c = localStorage.getItem('st_cs2_config');
+        if (c) {
+            const parsed = JSON.parse(c);
+            if (parsed && typeof parsed === 'object') {
+                result.cs2Config = parsed;
             }
         }
     } catch(e) {

@@ -35,12 +35,12 @@ export const desktopData = [
     { 
         name: "Music", 
         type: "folder", 
-        content: [
-            { name: "Too Many Nights", type: "music", src: "files/music/song1.mp3", customIcon: "files/cover/song1.jpg" },
-            { name: "Magnolia", type: "music", src: "files/music/song2.mp3", customIcon: "files/cover/song2.jpg" },
-            { name: "Freestyle", type: "music", src: "files/music/song3.mp3", customIcon: "files/cover/song3.jpg" },
-            { name: "Cancun", type: "music", src: "files/music/song4.mp3", customIcon: "files/cover/song4.jpg" }
-        ]
+        content: []
+    },
+    { 
+        name: "CS2", 
+        type: "cs2", 
+        content: []
     },
     { name: "text.txt", type: "file" },
     { name: "Snake", type: "snake" },
@@ -51,29 +51,4 @@ export const desktopData = [
     { name: "Guestbook", type: "guestbook" }
 ];
 
-export const musicLibrary = [
-    { 
-        title: "Too Many Nights", 
-        artist: "Metro Boomin", 
-        src: "files/music/song1.mp3", 
-        cover: "files/cover/song1.jpg" 
-    },
-    { 
-        title: "Magnolia", 
-        artist: "PlayBoi Carti", 
-        src: "files/music/song2.mp3", 
-        cover: "files/cover/song2.jpg" 
-    },
-    { 
-        title: "Freestyle 2", 
-        artist: "Ken Carson", 
-        src: "files/music/song3.mp3", 
-        cover: "files/cover/song3.jpg" 
-    },
-    { 
-        title: "CANCUN", 
-        artist: "Playboi Carti", 
-        src: "files/music/song4.mp3", 
-        cover: "files/cover/song4.jpg" 
-    }
-];
+export const musicLibrary = [];

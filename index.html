@@ -3,13 +3,14 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SPIKETONES007 </title>
+    <title>SPIKETONES007 OS</title>
     <meta name="description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
     <meta property="og:title" content="SPIKETONES007 OS" />
     <meta property="og:description" content="Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
     <script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+    <script src="https://www.youtube.com/iframe_api"></script>
     <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -166,22 +167,57 @@
         </div>
     </div>
 
-    <!-- Music Upload & Custom Cover Modal -->
+    <!-- Music Add & Artwork Modal (Supports Link/Stream & Upload) -->
     <div id="music-upload-overlay" class="music-upload-overlay" style="display: none;">
         <div class="music-upload-card">
             <div class="music-upload-header">
                 <div class="music-upload-title">
                     <iconify-icon icon="fluent:music-note-2-24-filled" width="20" height="20" style="color: #ff8c00;"></iconify-icon>
-                    <span>Upload Music & Custom Cover</span>
+                    <span>Add Music & Artwork</span>
                 </div>
                 <button class="music-upload-close" id="btn-close-music-upload" title="Close">✕</button>
             </div>
             <div class="music-upload-body">
-                <!-- Step 1: Audio File -->
-                <div class="music-upload-section">
+                <!-- Source Mode Selector (Link vs File) -->
+                <div class="music-source-tabs">
+                    <button type="button" class="music-source-tab active" id="tab-src-link">
+                        <iconify-icon icon="fluent:link-24-filled" width="15" height="15"></iconify-icon>
+                        <span>Link to Song (Stream / No Storage)</span>
+                    </button>
+                    <button type="button" class="music-source-tab" id="tab-src-upload">
+                        <iconify-icon icon="fluent:arrow-upload-24-filled" width="15" height="15"></iconify-icon>
+                        <span>Upload Audio File</span>
+                    </button>
+                </div>
+
+                <!-- Panel 1: Web Link / Direct URL (Default) -->
+                <div id="panel-music-link" class="music-upload-section">
+                    <label class="music-upload-label">
+                        <iconify-icon icon="fluent:globe-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
+                        <span>Song Audio Link / Stream URL</span>
+                    </label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="url" id="modal-music-url" class="music-text-input" style="flex: 1;" placeholder="Paste YouTube, Spotify, SoundCloud, Google Drive, or MP3 link..." autocomplete="off" />
+                        <button type="button" class="folder-action-btn" id="btn-test-music-url" title="Preview audio, video, or stream" style="white-space: nowrap; height: 36px;">
+                            <iconify-icon icon="fluent:play-16-filled" width="14" height="14"></iconify-icon>
+                            <span>Test</span>
+                        </button>
+                    </div>
+                    <div class="music-link-hint" id="modal-music-hint">
+                        <iconify-icon icon="fluent:info-16-filled" width="14" height="14" style="color: #ff8c00;"></iconify-icon>
+                        <span>Supports YouTube, Spotify, SoundCloud, Google Drive audio, direct MP3s, and streams. Plays in background!</span>
+                    </div>
+                    <div id="modal-yt-indicator" style="display: none; background: rgba(255, 140, 0, 0.12); border: 1px solid rgba(255, 140, 0, 0.35); border-radius: 6px; padding: 7px 10px; font-size: 11.5px; color: #ffdfba; align-items: center; gap: 8px; margin-top: 4px;">
+                        <span id="modal-provider-icon" style="display: inline-flex; align-items: center;"></span>
+                        <span id="modal-yt-indicator-text" style="flex: 1;">Track detected! Auto-retrieving song title, artist & album cover...</span>
+                    </div>
+                </div>
+
+                <!-- Panel 2: Audio File Upload -->
+                <div id="panel-music-upload" class="music-upload-section" style="display: none;">
                     <label class="music-upload-label">
                         <iconify-icon icon="fluent:speaker-2-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
-                        <span>1. Audio File (MP3, WAV, OGG, FLAC, M4A)</span>
+                        <span>Audio File (MP3, WAV, OGG, FLAC, M4A)</span>
                     </label>
                     <div class="music-drop-zone" id="music-audio-dropzone">
                         <input type="file" id="modal-audio-input" accept="audio/*" style="display: none;" />
@@ -189,26 +225,41 @@
                         <div class="drop-text" id="modal-audio-name">Click or drag & drop audio track</div>
                         <div class="drop-subtext">Supported formats: .mp3, .wav, .ogg, .flac, .m4a</div>
                     </div>
-                    <audio id="modal-audio-preview" controls style="display: none; width: 100%; margin-top: 6px; height: 32px;"></audio>
                 </div>
 
-                <!-- Step 2: Custom Cover Art -->
+                <!-- Audio & YouTube Preview Container -->
+                <div id="modal-preview-container">
+                    <audio id="modal-audio-preview" controls style="display: none; width: 100%; height: 32px;"></audio>
+                    <div id="modal-yt-preview-wrap" style="display: none; width: 100%; aspect-ratio: 16/9; max-height: 190px; border-radius: 8px; overflow: hidden; background: #000; border: 1px solid rgba(255,255,255,0.15); margin-top: 4px;">
+                        <iframe id="modal-yt-preview-iframe" style="width: 100%; height: 100%; border: none;" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+                    </div>
+                </div>
+
+                <!-- Step 2: Custom Cover Art / Artwork -->
                 <div class="music-upload-section">
                     <label class="music-upload-label">
                         <iconify-icon icon="fluent:image-24-filled" width="16" height="16" style="color: #ff8c00;"></iconify-icon>
-                        <span>2. Custom Cover Art (PNG, JPG, WEBP)</span>
+                        <span>Cover Artwork (Image Link or Upload)</span>
                     </label>
-                    <div style="display: flex; gap: 14px; align-items: center;">
-                        <div class="cover-preview-box" id="modal-cover-preview-box" title="Click to upload custom cover image">
+                    <div style="display: flex; gap: 14px; align-items: flex-start;">
+                        <div class="cover-preview-box" id="modal-cover-preview-box" title="Cover artwork preview">
                             <img id="modal-cover-preview-img" src="files/cover/song1.jpg" alt="Cover Preview" />
                         </div>
                         <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
-                            <input type="file" id="modal-cover-input" accept="image/*" style="display: none;" />
-                            <button class="folder-action-btn primary" type="button" id="btn-browse-cover">
-                                <iconify-icon icon="fluent:image-add-24-filled" width="16" height="16"></iconify-icon>
-                                <span>Browse Cover Image</span>
-                            </button>
-                            <div style="font-size: 11px; color: rgba(255,255,255,0.45);">Or pick default cover preset:</div>
+                            <!-- Option A: Paste Artwork Image Link -->
+                            <div style="display: flex; gap: 6px;">
+                                <input type="url" id="modal-cover-url-input" class="music-text-input" style="flex: 1; height: 32px; font-size: 11.5px;" placeholder="Paste Artwork Image URL (https://...)" />
+                                <button type="button" class="folder-action-btn" id="btn-apply-cover-url" style="padding: 0 10px; height: 32px; font-size: 11px;">Apply</button>
+                            </div>
+                            <!-- Option B: Upload Image File -->
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <input type="file" id="modal-cover-input" accept="image/*" style="display: none;" />
+                                <button class="folder-action-btn" type="button" id="btn-browse-cover" style="font-size: 11.5px; padding: 6px 12px;">
+                                    <iconify-icon icon="fluent:image-add-24-filled" width="15" height="15"></iconify-icon>
+                                    <span>Browse Image File</span>
+                                </button>
+                                <span style="font-size: 11px; color: rgba(255,255,255,0.4);">or preset:</span>
+                            </div>
                             <div style="display: flex; gap: 6px;" id="modal-cover-presets">
                                 <img class="cover-preset-thumb" data-src="files/cover/song1.jpg" src="files/cover/song1.jpg" title="Song 1 Cover" />
                                 <img class="cover-preset-thumb" data-src="files/cover/song2.jpg" src="files/cover/song2.jpg" title="Song 2 Cover" />
@@ -234,8 +285,8 @@
             <div class="music-upload-footer">
                 <button class="folder-action-btn" id="btn-cancel-music-modal">Cancel</button>
                 <button class="folder-action-btn primary" id="btn-confirm-music-modal" disabled>
-                    <iconify-icon icon="fluent:checkmark-24-filled" width="15" height="15"></iconify-icon>
-                    <span>Add to Music Folder & Player</span>
+                    <iconify-icon icon="fluent:play-circle-24-filled" width="16" height="16"></iconify-icon>
+                    <span>Add & Play in Background</span>
                 </button>
             </div>
         </div>

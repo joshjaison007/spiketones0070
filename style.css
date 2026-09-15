@@ -1143,6 +1143,22 @@ body.user-admin .start-menu {
     color: #d96232;
 }
 
+#hdd-video-btn {
+    font-size: 13px;
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: rgba(255, 0, 0, 0.18);
+    color: #ff4757;
+    border: 1px solid rgba(255, 0, 0, 0.35);
+    margin-left: 2px;
+}
+
+#hdd-video-btn:hover {
+    background: rgba(255, 0, 0, 0.35);
+    color: #ffffff;
+    box-shadow: 0 0 8px rgba(255, 71, 87, 0.5);
+}
+
 /* ===== GUESTBOOK (pinned bottom-right panel as in screenshot) ===== */
 .window.guestbook-panel {
     width: 326px;
@@ -2996,6 +3012,53 @@ body:not(.user-admin) #ctx-desktop-upload-music {
     gap: 8px;
 }
 
+.music-source-tabs {
+    display: flex;
+    gap: 6px;
+    background: rgba(0, 0, 0, 0.4);
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.music-source-tab {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 10px;
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.65);
+    font-size: 11.5px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.music-source-tab:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.music-source-tab.active {
+    background: #c85627;
+    color: #ffffff;
+    font-weight: 600;
+    box-shadow: 0 2px 8px rgba(200, 86, 39, 0.4);
+}
+
+.music-link-hint {
+    font-size: 11px;
+    color: rgba(255, 190, 130, 0.9);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 2px;
+}
+
 .music-upload-label {
     font-size: 12px;
     font-weight: 600;
@@ -3104,6 +3167,72 @@ body:not(.user-admin) #ctx-desktop-upload-music {
     padding: 12px 18px;
     background: rgba(0, 0, 0, 0.3);
     border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* ==========================================================================
+   YOUTUBE FLOATING / BACKGROUND VIDEO WINDOW
+   ========================================================================== */
+.yt-video-window {
+    position: fixed;
+    bottom: 84px;
+    right: 24px;
+    width: 380px;
+    height: 254px;
+    background: #141212;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 10px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.85);
+    z-index: 9998;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: opacity 0.2s cubic-bezier(0.1, 0.9, 0.2, 1), transform 0.2s cubic-bezier(0.1, 0.9, 0.2, 1);
+}
+
+.yt-video-window.yt-hidden {
+    opacity: 0.001 !important;
+    pointer-events: none !important;
+    transform: scale(0.92) translate3d(0, 30px, 0) !important;
+    /* Maintained in DOM with tiny opacity so YouTube stream plays uninterrupted */
+}
+
+.yt-video-window .window-header {
+    height: 32px;
+    padding: 0 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: move;
+    user-select: none;
+    box-sizing: border-box;
+}
+
+.yt-video-window .window-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #ffffff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.yt-video-window .window-body {
+    flex: 1;
+    background: #000;
+    position: relative;
+    overflow: hidden;
+    padding: 0;
+}
+
+.yt-video-window iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
 }
 
 /* ==========================================================================
