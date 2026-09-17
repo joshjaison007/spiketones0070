@@ -18,7 +18,12 @@ import {
     isFirebaseConfigured,
     isFirebaseStorageConfigured,
     subscribeFirebaseStatus,
-    pingFirebase
+    pingFirebase,
+    saveDesktopPositions,
+    sendMailMessage,
+    fetchMailMessages,
+    deleteMailMessage,
+    subscribeMailMessages
 } from './database.js';
 
 // In-memory audio data URL cache for fast playback
@@ -77,6 +82,106 @@ export function isYouTubeTrack(track) {
     return !!extractYouTubeId(src);
 }
 
+// Google Drive Audio & Video Helpers
+export function extractGoogleDriveId(url) {
+    if (!url || typeof url !== 'string') return null;
+    const match = url.match(/(?:\/file\/d\/|\/d\/|id=|open\?id=|\/folders\/)([a-zA-Z0-9_-]{15,})/);
+    return match ? match[1] : null;
+}
+
+export function convertGoogleDriveAudioUrl(url) {
+    const id = extractGoogleDriveId(url);
+    if (id) {
+        return `https://drive.google.com/uc?export=download&id=${id}`;
+    }
+    return url;
+}
+
+export function isGoogleDriveTrack(track) {
+    if (!track) return false;
+    const src = track.src || track.url || (typeof track === "string" ? track : "");
+    return track.isGoogleDrive || (typeof src === "string" && (src.includes("drive.google.com") || src.includes("docs.google.com")));
+}
+
+// Spotify Audio Helpers
+export function extractSpotifyTrackId(url) {
+    if (!url || typeof url !== 'string') return null;
+    const match = url.match(/track[\/:]([a-zA-Z0-9]{22})/);
+    return match ? match[1] : null;
+}
+
+export function isSpotifyTrack(track) {
+    if (!track) return false;
+    const src = track.src || track.url || "";
+    return track.isSpotify || (typeof src === "string" && (src.includes("spotify.com") || src.includes("open.spotify.com")));
+}
+
+export async function fetchSpotifyMetadata(url) {
+    try {
+        const resp = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            return {
+                title: data.title || "Spotify Track",
+                artist: data.author_name || "Spotify Artist",
+                thumbnail: data.thumbnail_url || "files/cover/song1.jpg"
+            };
+        }
+    } catch (e) {
+        console.warn("Could not fetch Spotify oEmbed:", e);
+    }
+    return null;
+}
+
+// SoundCloud Audio Helpers
+export function isSoundCloudTrack(track) {
+    if (!track) return false;
+    const src = track.src || track.url || "";
+    return track.isSoundCloud || (typeof src === "string" && src.includes("soundcloud.com"));
+}
+
+export async function fetchSoundCloudMetadata(url) {
+    try {
+        const resp = await fetch(`https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(url)}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            return {
+                title: data.title || "SoundCloud Track",
+                artist: data.author_name || "SoundCloud Artist",
+                thumbnail: data.thumbnail_url || "files/cover/song1.jpg"
+            };
+        }
+    } catch (e) {
+        console.warn("Could not fetch SoundCloud oEmbed:", e);
+    }
+    return null;
+}
+
+// Universal media metadata fetcher
+export async function fetchUniversalMediaMetadata(url) {
+    if (!url || typeof url !== "string") return null;
+    const cleanUrl = url.trim();
+
+    if (extractYouTubeId(cleanUrl)) {
+        return await fetchYouTubeMetadata(cleanUrl);
+    }
+    if (isSpotifyTrack({ src: cleanUrl })) {
+        return await fetchSpotifyMetadata(cleanUrl);
+    }
+    if (isSoundCloudTrack({ src: cleanUrl })) {
+        return await fetchSoundCloudMetadata(cleanUrl);
+    }
+    if (isGoogleDriveTrack({ src: cleanUrl })) {
+        const id = extractGoogleDriveId(cleanUrl);
+        return {
+            title: `Drive Audio (${id ? id.substring(0, 8) : "File"})`,
+            artist: "Google Drive",
+            thumbnail: "files/cover/song1.jpg"
+        };
+    }
+    return null;
+}
+
 export function getYouTubeThumbnail(videoId) {
     return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 }
@@ -127,65 +232,22 @@ export async function fetchYouTubeMetadata(urlOrId) {
 }
 
 export function initYouTubePlayer() {
-    let wrap = document.getElementById("yt-video-window");
-    if (!wrap) {
-        wrap = document.createElement("div");
-        wrap.id = "yt-video-window";
-        wrap.className = "window yt-video-window yt-hidden";
-        wrap.innerHTML = `
-            <div class="window-header" id="yt-video-titlebar">
-                <div class="window-title">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="#FF0000" style="vertical-align: middle; flex-shrink: 0;"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
-                    <span id="yt-video-title-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">YouTube Player</span>
-                </div>
-                <div class="window-controls">
-                    <button class="win-btn" id="yt-video-min" title="Minimize (Music keeps playing)">_</button>
-                    <button class="win-btn close" id="yt-video-close" title="Hide Video (Music keeps playing)">✕</button>
-                </div>
-            </div>
-            <div class="window-body">
-                <div id="yt-player-slot" style="width: 100%; height: 100%;"></div>
-            </div>
-        `;
-        document.body.appendChild(wrap);
+    // Remove any legacy floating video window if it exists
+    const oldWrap = document.getElementById("yt-video-window");
+    if (oldWrap) oldWrap.remove();
 
-        // Draggable window header
-        const titlebar = wrap.querySelector("#yt-video-titlebar");
-        let isDragging = false;
-        let startX = 0, startY = 0, initialLeft = 0, initialTop = 0;
-        titlebar.addEventListener("mousedown", (e) => {
-            if (e.target.closest(".window-controls")) return;
-            isDragging = true;
-            bringToFront(wrap);
-            const rect = wrap.getBoundingClientRect();
-            startX = e.clientX;
-            startY = e.clientY;
-            initialLeft = rect.left;
-            initialTop = rect.top;
-
-            const onMove = (ev) => {
-                if (!isDragging) return;
-                wrap.style.left = `${initialLeft + (ev.clientX - startX)}px`;
-                wrap.style.top = `${initialTop + (ev.clientY - startY)}px`;
-                wrap.style.right = "auto";
-                wrap.style.bottom = "auto";
-            };
-            const onUp = () => {
-                isDragging = false;
-                document.removeEventListener("mousemove", onMove);
-                document.removeEventListener("mouseup", onUp);
-            };
-            document.addEventListener("mousemove", onMove);
-            document.addEventListener("mouseup", onUp);
-        });
-
-        wrap.querySelector("#yt-video-close").addEventListener("click", () => {
-            wrap.classList.add("yt-hidden");
-            showToast("Video hidden. Playing in background (click 📺 on HDD to restore).");
-        });
-        wrap.querySelector("#yt-video-min").addEventListener("click", () => {
-            wrap.classList.add("yt-hidden");
-        });
+    let slot = document.getElementById("yt-player-slot");
+    if (!slot) {
+        let bridge = document.getElementById("bg-media-bridge");
+        if (!bridge) {
+            bridge = document.createElement("div");
+            bridge.id = "bg-media-bridge";
+            bridge.className = "bg-media-bridge";
+            document.body.appendChild(bridge);
+        }
+        slot = document.createElement("div");
+        slot.id = "yt-player-slot";
+        bridge.appendChild(slot);
     }
 
     // Connect YouTube IFrame API
@@ -325,17 +387,7 @@ export function resumeYouTubeVideo() {
 }
 
 export function toggleYouTubeVideoWindow() {
-    initYouTubePlayer();
-    const wrap = document.getElementById("yt-video-window");
-    if (!wrap) return;
-    if (wrap.classList.contains("yt-hidden")) {
-        wrap.classList.remove("yt-hidden");
-        bringToFront(wrap);
-        showToast("Now viewing YouTube video");
-    } else {
-        wrap.classList.add("yt-hidden");
-        showToast("Video hidden. Continuing audio in background");
-    }
+    // Audio-only playback per user request: video UI removed
 }
 
 // Ensure music library is normalized without resurrecting deleted tracks
@@ -409,9 +461,183 @@ let isPlaying = false;
 let audio = new Audio();
 audio.crossOrigin = "anonymous";
 
+// Default CS2 & Leetify Configuration
+export const DEFAULT_CS2_CONFIG = {
+    videoUrl: "https://assets.mixkit.co/videos/preview/mixkit-military-soldier-aiming-in-the-dark-42407-large.mp4",
+    videoTitle: "CS2 Cinematic Cover Video",
+    leetifyApiKey: "cc554ec3-3db6-4f54-83b2-c070c40da483",
+    leetifyUrl: "https://leetify.com/app/profile/76561199580350164",
+    steamId: "76561199580350164",
+    playerName: "spiketones007",
+    skillRating: 60.17,
+    nationalRank: 436,
+    premierRating: 15003,
+    recentMatch: {
+        map: "anubis",
+        date: "15 Sep 2026 9:20 PM",
+        result: "WIN",
+        score: "13:10",
+        matchImpact: "+6.66%",
+        tSide: "+5.52%",
+        ctSide: "+7.9%",
+        rounds: [
+            { r: 1, val: 5.2, side: "ct" },
+            { r: 2, val: 3.8, side: "ct" },
+            { r: 3, val: 1.5, side: "ct" },
+            { r: 4, val: 0.6, side: "ct" },
+            { r: 5, val: 0.2, side: "ct" },
+            { r: 6, val: -1.4, side: "t" },
+            { r: 7, val: -2.8, side: "t" },
+            { r: 8, val: -4.1, side: "t" },
+            { r: 9, val: 1.9, side: "t" },
+            { r: 10, val: 3.2, side: "t" }
+        ]
+    },
+    trend: [
+        { label: "G1", impact: 6.66 },
+        { label: "G2", impact: -0.3 },
+        { label: "G3", impact: -5.3 },
+        { label: "G4", impact: -10.3 },
+        { label: "G5", impact: 4.2 }
+    ],
+    radar: {
+        aimedReactionTime: 36,
+        accuracy: 98,
+        timeToFire: 45,
+        crosshairPlacement: 53,
+        headshotRate: 69
+    },
+    stats: {
+        headshot: "69%",
+        leetifyRating: "+5.42",
+        aimScore: "89 / 100",
+        crosshairPlacement: "7.1°",
+        winRate: "64.2%",
+        clutchRating: "74%",
+        kd: "1.38",
+        adr: "92.4"
+    },
+    crosshairCode: "CSGO-SL7LH-GOWPk-mV2m3-bO9QG-RcCcO",
+    performanceRadar: {
+        aim: 82.4,
+        positioning: 65.9,
+        utility: 40.4
+    },
+    benchmarkRadar: {
+        aim: 92.0,
+        positioning: 78.0,
+        utility: 65.0
+    },
+    attributes: {
+        accuracy: "38.7%",
+        headshot: "17.3%",
+        counterStrafing: "75.1%",
+        reactionTime: "518ms",
+        sprayAccuracy: "42.8%",
+        preaim: "8.84°",
+        heDamage: "9.51",
+        flashDuration: "2.12s",
+        utilityOnDeath: "$446",
+        tradedDeaths: "56.1%",
+        tradeKillOpp: "0.41"
+    },
+    club: {
+        tag: "007 [L7] 007",
+        winRate: "70%"
+    },
+    partySize: {
+        solo: 90,
+        stack: 10,
+        full: 0
+    },
+    steamDetails: {
+        id: "76561199580350164",
+        age: "3 years",
+        level: 20,
+        matches: 1315,
+        hours: 844,
+        lastMatch: "3 hours ago"
+    },
+    ranksOverview: {
+        premier: "15,003",
+        premierPeak: "15,118",
+        competitive: "Silver Elite Master",
+        wingman: "Gold Nova II",
+        mapRanks: [
+            { map: "Anubis", rank: "Silver Elite Master" },
+            { map: "Inferno", rank: "Silver Elite Master" },
+            { map: "Mirage", rank: "Silver Elite Master" },
+            { map: "Dust II", rank: "Gold Nova I" }
+        ]
+    },
+    seasons: [
+        {
+            name: "Season Five",
+            dates: "2025-05-22 – Present",
+            active: true,
+            matches: 161,
+            winRate: "58%",
+            kd: "1.25",
+            premierMin: "7,557",
+            premierMax: "15,118",
+            premierCurrent: "15,003",
+            comp: "Silver Elite Master",
+            wingman: "Gold Nova II"
+        },
+        {
+            name: "Season Four",
+            dates: "2024-10-15 – 2025-05-21",
+            active: false,
+            matches: 342,
+            winRate: "55%",
+            kd: "1.18",
+            premierMin: "3,777",
+            premierMax: "12,305",
+            comp: "Silver Elite",
+            wingman: "Silver IV"
+        }
+    ],
+    matches: [
+        { map: "de_anubis", result: "WIN", score: "13 : 10", kd: "1.93", hs: "69%", leetify: "+14.15", spray: "43.4%", accuracy: "40.5%", reaction: "500ms", preaim: "7.7°", date: "15 Sep 2026, 9:20 PM" },
+        { map: "de_anubis", result: "WIN", score: "13 : 8", kd: "2.00", hs: "63%", leetify: "+10.49", spray: "41.2%", accuracy: "39.1%", reaction: "492ms", preaim: "8.1°", date: "14 Sep 2026, 7:15 PM" },
+        { map: "de_inferno", result: "WIN", score: "9 : 4", kd: "1.83", hs: "58%", leetify: "+13.49", spray: "45.0%", accuracy: "42.0%", reaction: "485ms", preaim: "7.2°", date: "13 Sep 2026, 11:30 PM" },
+        { map: "de_inferno", result: "WIN", score: "9 : 6", kd: "2.10", hs: "68%", leetify: "+19.36", spray: "46.1%", accuracy: "44.3%", reaction: "478ms", preaim: "6.9°", date: "12 Sep 2026, 8:40 PM" },
+        { map: "de_mirage", result: "LOSS", score: "4 : 13", kd: "0.85", hs: "52%", leetify: "-0.07", spray: "36.5%", accuracy: "34.0%", reaction: "540ms", preaim: "10.2°", date: "10 Sep 2026, 6:10 PM" }
+    ]
+};
+export let currentCs2Config = { ...DEFAULT_CS2_CONFIG };
+
+export const DEFAULT_DESKTOP_ICON_POSITIONS = {
+    "Socials": { x: 20, y: 20 },
+    "Links": { x: 20, y: 110 },
+    "Music": { x: 20, y: 200 },
+    "CS2": { x: 20, y: 290 },
+    "Mail": { x: 20, y: 380 },
+    "text.txt": { x: 20, y: 470 },
+    "Snake": { x: 115, y: 20 },
+    "Terminal": { x: 115, y: 110 },
+    "Paint": { x: 115, y: 200 },
+    "Calculator": { x: 115, y: 290 },
+    "Guestbook": { x: 115, y: 380 },
+    "Sticky Notes": { x: 115, y: 470 },
+    "Admin Settings": { x: 210, y: 20 }
+};
+
+export let currentDesktopPositions = { ...DEFAULT_DESKTOP_ICON_POSITIONS };
+
 // Initial local overrides fallback before remote fetch
 try {
+    const rawPositions = localStorage.getItem("st_desktop_positions");
+    if (rawPositions) {
+        currentDesktopPositions = { ...currentDesktopPositions, ...JSON.parse(rawPositions) };
+    }
+} catch (e) {}
+
+try {
     const initialOverrides = loadLocalOverrides();
+    if (initialOverrides.desktopPositions && typeof initialOverrides.desktopPositions === 'object') {
+        currentDesktopPositions = { ...currentDesktopPositions, ...initialOverrides.desktopPositions };
+    }
     if (initialOverrides.desktopData && Array.isArray(initialOverrides.desktopData)) {
         currentDesktopData = initialOverrides.desktopData;
     }
@@ -423,6 +649,9 @@ try {
     }
     if (initialOverrides.musicLibrary && Array.isArray(initialOverrides.musicLibrary)) {
         currentMusicLibrary = sanitizeMusicLibrary(initialOverrides.musicLibrary);
+    }
+    if (initialOverrides.cs2Config && typeof initialOverrides.cs2Config === 'object') {
+        currentCs2Config = { ...DEFAULT_CS2_CONFIG, ...initialOverrides.cs2Config };
     }
 } catch (e) {
     console.warn("Failed reading local overrides; using defaults:", e);
@@ -485,6 +714,17 @@ function sanitizeDesktopData(data) {
     }
     if (!result.some(d => d.name === "Music")) {
         result.push({ name: "Music", type: "folder", content: [] });
+    }
+    if (!result.some(d => d.name === "CS2" || d.type === "cs2")) {
+        result.push({ name: "CS2", type: "cs2", content: [] });
+    }
+    if (!result.some(d => d.name === "Mail" || d.type === "mail")) {
+        const cs2Idx = result.findIndex(d => d.name === "CS2" || d.type === "cs2");
+        if (cs2Idx !== -1) {
+            result.splice(cs2Idx + 1, 0, { name: "Mail", type: "mail" });
+        } else {
+            result.push({ name: "Mail", type: "mail" });
+        }
     }
     result.forEach(item => {
         if ((item.type === "stickynotes" || item.name === "Sticky Notes") && item.customIcon === "fluent:note-pin-24-filled") {
@@ -1014,6 +1254,7 @@ function getIconMetadata(item) {
     if (item.type === "terminal") return { icon: "fluent:window-console-20-filled", color: "#2ed573" };
     if (item.type === "snake") return { icon: "fluent:games-24-filled", color: "#ffa502" };
     if (item.type === "stickynotes" || item.name === "Sticky Notes") return { icon: "fluent:note-24-filled", color: "#ffd32a" };
+    if (item.type === "cs2" || item.name === "CS2") return { icon: "fluent:games-24-filled", color: "#ff7700" };
     return { icon: "fluent:app-folder-24-filled", color: "#cccccc" };
 }
 
@@ -1026,6 +1267,18 @@ function getIconHTML(item, size = "large") {
         const coverSrc = item.cover || item.customIcon;
         const meta = getIconMetadata(item);
         return `<img src="${coverSrc}" class="custom-icon-cover" style="width: ${dim}px; height: ${dim}px; border-radius: 8px; object-fit: cover;" onerror="this.outerHTML='<iconify-icon icon=\\'${meta.icon}\\' width=\\'${dim}\\' height=\\'${dim}\\' style=\\'color: ${meta.color};\\'></iconify-icon>';" />`;
+    }
+
+    // Counter-Strike 2 Tactical Folder / App Icon
+    if (item.type === "cs2" || nameLower === "cs2") {
+        return `<svg width="${dim}" height="${dim}" viewBox="0 0 48 48" fill="none" style="filter: drop-shadow(0 3px 10px rgba(255, 119, 0, 0.45));">
+            <rect width="48" height="48" rx="10" fill="#13151f"/>
+            <rect x="1" y="1" width="46" height="46" rx="9" stroke="rgba(255, 120, 0, 0.4)" stroke-width="1.5"/>
+            <path d="M12 15C12 13.3431 13.3431 12 15 12H23C24.6569 12 26 13.3431 26 15V19C26 20.6569 24.6569 22 23 22H16V26H23C24.6569 26 26 27.3431 26 29V33C26 34.6569 24.6569 36 23 36H15C13.3431 36 12 34.6569 12 33V15Z" fill="#ff7700"/>
+            <path d="M28 15C28 13.3431 29.3431 12 31 12H34C35.6569 12 37 13.3431 37 15V23C37 24.6569 35.6569 26 34 26H31V30H37V36H28V15Z" fill="#ffffff"/>
+            <path d="M36 10L40 10L32 38L28 38L36 10Z" fill="#ff5500" opacity="0.85"/>
+            <text x="24" y="44" fill="#ffaa33" font-family="'Segoe UI', system-ui, sans-serif" font-weight="900" font-size="7" text-anchor="middle" letter-spacing="0.8">CS2</text>
+        </svg>`;
     }
 
     // Specific Brand SVGs for 100% guarantee visibility & crisp Windows 11 look
@@ -1042,6 +1295,16 @@ function getIconHTML(item, size = "large") {
             <path d="M6 30H18V42L6 30Z" fill="#FFF1B8"/>
             <line x1="12" y1="16" x2="36" y2="16" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.9"/>
             <line x1="12" y1="23" x2="30" y2="23" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.9"/>
+        </svg>`;
+    }
+    if (item.type === "mail" || nameLower === "mail" || nameLower === "gmail") {
+        return `<svg width="${dim}" height="${dim}" viewBox="0 0 48 48" fill="none" style="filter: drop-shadow(0 2px 7px rgba(234, 67, 53, 0.4));">
+            <rect width="48" height="48" rx="10" fill="#ffffff" fill-opacity="0.06"/>
+            <path fill="#4caf50" d="M42,16.2l-5,2.75l-5,4.75L32,38h7c1.657,0,3-1.343,3-3V16.2z"></path>
+            <path fill="#1e88e5" d="M6,16.2l3.614,1.71L16,23.7V38H9c-1.657,0-3-1.343-3-3V16.2z"></path>
+            <polygon fill="#e53935" points="32,11.2 24,18.45 16,11.2 15,16.5 16,23.7 24,30.95 32,23.7 33,16.5"></polygon>
+            <path fill="#c62828" d="M6,12.3V16.2l10,7.5V11.2L12.876,8.859C11.132,7.553,8.642,8.026,7.475,9.873 C6.535,11.36,6.486,11.834,6,12.3z"></path>
+            <path fill="#fbc02d" d="M42,12.3V16.2l-10,7.5V11.2l3.124-2.341c1.744-1.307,4.234-0.834,5.401,1.014 C41.465,11.36,41.514,11.834,42,12.3z"></path>
         </svg>`;
     }
 
@@ -1079,25 +1342,105 @@ function renderDesktop() {
             badgeHTML = `<div class="hidden-for-guest-badge" title="Hidden for guest"><iconify-icon icon="fluent:eye-off-24-filled" width="13" height="13"></iconify-icon></div>`;
         }
 
+        const pos = (currentDesktopPositions && currentDesktopPositions[item.name])
+            || (DEFAULT_DESKTOP_ICON_POSITIONS && DEFAULT_DESKTOP_ICON_POSITIONS[item.name])
+            || { x: 20 + Math.floor(index / 6) * 95, y: 20 + (index % 6) * 90 };
+        iconDiv.style.position = "absolute";
+        iconDiv.style.left = `${pos.x}px`;
+        iconDiv.style.top = `${pos.y}px`;
+        iconDiv.style.margin = "0";
+
         iconDiv.innerHTML = `
             ${badgeHTML}
             ${getIconHTML(item, "large")}
             <span>${escapeHTML(item.name)}</span>
         `;
-        iconDiv.addEventListener("click", () => handleItemClick(item));
 
-        // Drag & drop icon re-arranging and folder dropping for Admin
+        let didMovePointer = false;
+
+        // Drag & drop icon re-arranging and moving across the screen for Admin
         if (currentUser === "admin") {
             iconDiv.setAttribute("draggable", "true");
             iconDiv.addEventListener("dragstart", (e) => {
-                e.dataTransfer.setData("application/json", JSON.stringify({ source: "desktop", index }));
+                const rect = iconDiv.getBoundingClientRect();
+                e.dataTransfer.setData("application/json", JSON.stringify({
+                    source: "desktop",
+                    index,
+                    name: item.name,
+                    offsetX: e.clientX - rect.left,
+                    offsetY: e.clientY - rect.top
+                }));
                 iconDiv.classList.add("dragging");
             });
             iconDiv.addEventListener("dragend", () => {
                 iconDiv.classList.remove("dragging");
             });
 
+            // Direct tactile pointer drag for moving icons anywhere on desktop
+            let isDragging = false;
+            let startX = 0, startY = 0;
+            let initialLeft = 0, initialTop = 0;
+
+            iconDiv.addEventListener("mousedown", (e) => {
+                if (e.button !== 0) return;
+                const desktop = document.getElementById("desktop");
+                if (!desktop) return;
+                const deskRect = desktop.getBoundingClientRect();
+                const iconRect = iconDiv.getBoundingClientRect();
+
+                startX = e.clientX;
+                startY = e.clientY;
+                initialLeft = iconRect.left - deskRect.left;
+                initialTop = iconRect.top - deskRect.top;
+                didMovePointer = false;
+
+                const onMove = (ev) => {
+                    const dx = ev.clientX - startX;
+                    const dy = ev.clientY - startY;
+                    if (!didMovePointer && Math.hypot(dx, dy) > 6) {
+                        didMovePointer = true;
+                        isDragging = true;
+                        iconDiv.classList.add("dragging");
+                        iconDiv.style.position = "absolute";
+                        iconDiv.style.margin = "0";
+                        iconDiv.style.zIndex = "9999";
+                    }
+                    if (isDragging) {
+                        let curX = Math.round(initialLeft + dx);
+                        let curY = Math.round(initialTop + dy);
+                        curX = Math.max(10, Math.min(deskRect.width - 85, curX));
+                        curY = Math.max(10, Math.min(deskRect.height - 110, curY));
+                        iconDiv.style.left = `${curX}px`;
+                        iconDiv.style.top = `${curY}px`;
+                    }
+                };
+
+                const onUp = (ev) => {
+                    document.removeEventListener("mousemove", onMove);
+                    document.removeEventListener("mouseup", onUp);
+                    if (isDragging) {
+                        isDragging = false;
+                        iconDiv.classList.remove("dragging");
+                        iconDiv.style.zIndex = "";
+                        const dx = ev.clientX - startX;
+                        const dy = ev.clientY - startY;
+                        let finalX = Math.round(initialLeft + dx);
+                        let finalY = Math.round(initialTop + dy);
+                        finalX = Math.max(10, Math.min(deskRect.width - 85, finalX));
+                        finalY = Math.max(10, Math.min(deskRect.height - 110, finalY));
+
+                        currentDesktopPositions[item.name] = { x: finalX, y: finalY };
+                        saveDesktopPositions(currentDesktopPositions);
+                        showToast(`Repositioned "${item.name}"`);
+                    }
+                };
+
+                document.addEventListener("mousemove", onMove);
+                document.addEventListener("mouseup", onUp);
+            });
+
             if (item.type === "folder") {
+                iconDiv.setAttribute("data-is-folder", "true");
                 iconDiv.addEventListener("dragover", (e) => {
                     e.preventDefault();
                     iconDiv.classList.add("folder-drop-hover");
@@ -1106,6 +1449,7 @@ function renderDesktop() {
                     iconDiv.classList.remove("folder-drop-hover");
                 });
                 iconDiv.addEventListener("drop", (e) => {
+                    e.stopPropagation();
                     e.preventDefault();
                     iconDiv.classList.remove("folder-drop-hover");
                     try {
@@ -1116,6 +1460,10 @@ function renderDesktop() {
                             const [moved] = currentDesktopData.splice(data.index, 1);
                             if (!item.content) item.content = [];
                             item.content.push(moved);
+                            if (currentDesktopPositions[moved.name]) {
+                                delete currentDesktopPositions[moved.name];
+                                saveDesktopPositions(currentDesktopPositions);
+                            }
                             saveDesktopData(currentDesktopData);
                             renderDesktop();
                             showToast(`Moved "${moved.name}" into "${item.name}"`);
@@ -1127,6 +1475,14 @@ function renderDesktop() {
             }
         }
 
+        iconDiv.addEventListener("click", () => {
+            if (didMovePointer) {
+                didMovePointer = false;
+                return;
+            }
+            handleItemClick(item);
+        });
+
         container.appendChild(iconDiv);
     });
 
@@ -1135,11 +1491,99 @@ function renderDesktop() {
         const adminIconDiv = document.createElement("div");
         adminIconDiv.className = "icon admin-desktop-icon";
         adminIconDiv.id = "desktop-icon-admin";
+        const adminPos = (currentDesktopPositions && currentDesktopPositions["Admin Settings"])
+            || (DEFAULT_DESKTOP_ICON_POSITIONS && DEFAULT_DESKTOP_ICON_POSITIONS["Admin Settings"])
+            || { x: 210, y: 20 };
+        adminIconDiv.style.position = "absolute";
+        adminIconDiv.style.left = `${adminPos.x}px`;
+        adminIconDiv.style.top = `${adminPos.y}px`;
+        adminIconDiv.style.margin = "0";
         adminIconDiv.innerHTML = `
             <iconify-icon icon="fluent:settings-24-filled" width="44" height="44" style="color: #ff8c00; filter: drop-shadow(0 2px 8px rgba(255, 140, 0, 0.4));"></iconify-icon>
             <span>Admin Settings</span>
         `;
-        adminIconDiv.addEventListener("click", () => openAdminEditMode());
+        adminIconDiv.setAttribute("draggable", "true");
+        adminIconDiv.addEventListener("dragstart", (e) => {
+            const rect = adminIconDiv.getBoundingClientRect();
+            e.dataTransfer.setData("application/json", JSON.stringify({
+                source: "desktop",
+                name: "Admin Settings",
+                offsetX: e.clientX - rect.left,
+                offsetY: e.clientY - rect.top
+            }));
+            adminIconDiv.classList.add("dragging");
+        });
+        adminIconDiv.addEventListener("dragend", () => {
+            adminIconDiv.classList.remove("dragging");
+        });
+
+        let didMoveAdminPointer = false;
+        adminIconDiv.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
+            const desktop = document.getElementById("desktop");
+            if (!desktop) return;
+            const deskRect = desktop.getBoundingClientRect();
+            const iconRect = adminIconDiv.getBoundingClientRect();
+
+            let startX = e.clientX;
+            let startY = e.clientY;
+            let initialLeft = iconRect.left - deskRect.left;
+            let initialTop = iconRect.top - deskRect.top;
+            didMoveAdminPointer = false;
+            let isDraggingAdmin = false;
+
+            const onMove = (ev) => {
+                const dx = ev.clientX - startX;
+                const dy = ev.clientY - startY;
+                if (!didMoveAdminPointer && Math.hypot(dx, dy) > 6) {
+                    didMoveAdminPointer = true;
+                    isDraggingAdmin = true;
+                    adminIconDiv.classList.add("dragging");
+                    adminIconDiv.style.position = "absolute";
+                    adminIconDiv.style.margin = "0";
+                    adminIconDiv.style.zIndex = "9999";
+                }
+                if (isDraggingAdmin) {
+                    let curX = Math.round(initialLeft + dx);
+                    let curY = Math.round(initialTop + dy);
+                    curX = Math.max(10, Math.min(deskRect.width - 85, curX));
+                    curY = Math.max(10, Math.min(deskRect.height - 110, curY));
+                    adminIconDiv.style.left = `${curX}px`;
+                    adminIconDiv.style.top = `${curY}px`;
+                }
+            };
+
+            const onUp = (ev) => {
+                document.removeEventListener("mousemove", onMove);
+                document.removeEventListener("mouseup", onUp);
+                if (isDraggingAdmin) {
+                    isDraggingAdmin = false;
+                    adminIconDiv.classList.remove("dragging");
+                    adminIconDiv.style.zIndex = "";
+                    const dx = ev.clientX - startX;
+                    const dy = ev.clientY - startY;
+                    let finalX = Math.round(initialLeft + dx);
+                    let finalY = Math.round(initialTop + dy);
+                    finalX = Math.max(10, Math.min(deskRect.width - 85, finalX));
+                    finalY = Math.max(10, Math.min(deskRect.height - 110, finalY));
+
+                    currentDesktopPositions["Admin Settings"] = { x: finalX, y: finalY };
+                    saveDesktopPositions(currentDesktopPositions);
+                    showToast(`Repositioned "Admin Settings"`);
+                }
+            };
+
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        });
+
+        adminIconDiv.addEventListener("click", () => {
+            if (didMoveAdminPointer) {
+                didMoveAdminPointer = false;
+                return;
+            }
+            openAdminEditMode();
+        });
         container.appendChild(adminIconDiv);
     }
 }
@@ -1147,6 +1591,11 @@ function renderDesktop() {
 // --- Item Click Handler ---
 function handleItemClick(item) {
     if (!item) return;
+    if (item.type === "cs2" || (item.name && item.name.toLowerCase() === "cs2")) {
+        pauseCurrentPlayback();
+        openCs2Experience();
+        return;
+    }
     if (item.type === "folder") {
         openFolderWindow(item);
     } else if (item.type === "file") {
@@ -1167,6 +1616,8 @@ function handleItemClick(item) {
         openSnake();
     } else if (item.type === "stickynotes" || item.name === "Sticky Notes") {
         openStickyNotes();
+    } else if (item.type === "mail" || (item.name && (item.name.toLowerCase() === "mail" || item.name.toLowerCase() === "gmail"))) {
+        openMailApp();
     } else if (item.type === "link") {
         if (item.url) {
             try {
@@ -2351,6 +2802,1309 @@ export function openGuestbook() {
     }
 }
 
+// ==========================================================================
+// GMAIL-STYLE MAIL APPLICATION (OFFICIAL GMAIL EXPERIENCE)
+// ==========================================================================
+export function showGmailSnackbar({ senderId, subject, message, targetEmail = 'joshjaison2020@gmail.com' }) {
+    const existing = document.getElementById("gmail-global-snackbar");
+    if (existing) existing.remove();
+
+    const snack = document.createElement("div");
+    snack.id = "gmail-global-snackbar";
+    snack.className = "gmail-snackbar";
+
+    const mailto = `mailto:${targetEmail}?subject=${encodeURIComponent(subject || 'Message from Portfolio')}&body=${encodeURIComponent(`Sender ID: ${senderId}\n\n${message}`)}`;
+
+    snack.innerHTML = `
+        <span>Message sent to <strong>${targetEmail}</strong></span>
+        <a href="${mailto}" class="gmail-snackbar-link" title="Open in your default email application">Open in Email App ↗</a>
+        <button type="button" class="gmail-aux-btn" style="color: #fff; margin-left: 8px; font-size: 13px; padding: 2px 6px;">✕</button>
+    `;
+
+    const closeBtn = snack.querySelector("button");
+    if (closeBtn) closeBtn.onclick = () => snack.remove();
+
+    document.body.appendChild(snack);
+    setTimeout(() => {
+        if (document.body.contains(snack)) snack.remove();
+    }, 8000);
+}
+
+export function openMailApp(prefill = null) {
+    const winId = "win-mail-app";
+    const existing = document.getElementById(winId);
+    if (existing) {
+        existing.classList.remove("minimized");
+        bringToFront(existing);
+        updateTaskbar();
+        if (prefill) {
+            const subj = existing.querySelector("#gmail-subject-input");
+            const body = existing.querySelector("#gmail-body-input");
+            const sender = existing.querySelector("#gmail-sender-input");
+            if (subj && prefill.subject) subj.value = prefill.subject;
+            if (body && prefill.body) body.value = prefill.body;
+            if (sender && prefill.senderId) sender.value = prefill.senderId;
+        }
+        return existing;
+    }
+
+    const gmailIcon = `<svg width="20" height="20" viewBox="0 0 48 48" fill="none" style="display:inline-block; vertical-align:middle; flex-shrink: 0;">
+        <path fill="#4caf50" d="M42,16.2l-5,2.75l-5,4.75L32,38h7c1.657,0,3-1.343,3-3V16.2z"></path>
+        <path fill="#1e88e5" d="M6,16.2l3.614,1.71L16,23.7V38H9c-1.657,0-3-1.343-3-3V16.2z"></path>
+        <polygon fill="#e53935" points="32,11.2 24,18.45 16,11.2 15,16.5 16,23.7 24,30.95 32,23.7 33,16.5"></polygon>
+        <path fill="#c62828" d="M6,12.3V16.2l10,7.5V11.2L12.876,8.859C11.132,7.553,8.642,8.026,7.475,9.873 C6.535,11.36,6.486,11.834,6,12.3z"></path>
+        <path fill="#fbc02d" d="M42,12.3V16.2l-10,7.5V11.2l3.124-2.341c1.744-1.307,4.234-0.834,5.401,1.014 C41.465,11.36,41.514,11.834,42,12.3z"></path>
+    </svg>`;
+
+    const contentHTML = `
+        <!-- Compose View -->
+        <div class="gmail-compose-wrap" id="gmail-compose-view">
+            <!-- Recipients (To) -->
+            <div class="gmail-row">
+                <span class="gmail-lbl">To</span>
+                <div style="flex: 1; display: flex; align-items: center; gap: 8px;">
+                    <div class="gmail-to-chip" title="Direct destination to Josh">
+                        <span class="gmail-to-avatar">J</span>
+                        <span>Josh</span>
+                        <span class="gmail-to-email">&lt;joshjaison2020@gmail.com&gt;</span>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 4px;">
+                    <button type="button" class="gmail-aux-btn" id="gmail-toggle-cc">Cc</button>
+                    <button type="button" class="gmail-aux-btn" id="gmail-toggle-bcc">Bcc</button>
+                </div>
+            </div>
+
+            <!-- Optional Cc Row -->
+            <div class="gmail-row" id="gmail-row-cc" style="display: none;">
+                <span class="gmail-lbl">Cc</span>
+                <input type="text" id="gmail-cc-input" class="gmail-input" placeholder="Cc recipients" />
+            </div>
+
+            <!-- Optional Bcc Row -->
+            <div class="gmail-row" id="gmail-row-bcc" style="display: none;">
+                <span class="gmail-lbl">Bcc</span>
+                <input type="text" id="gmail-bcc-input" class="gmail-input" placeholder="Bcc recipients" />
+            </div>
+
+            <!-- Sender ID / Your Email -->
+            <div class="gmail-row">
+                <span class="gmail-lbl">From</span>
+                <input type="text" id="gmail-sender-input" class="gmail-input" placeholder="Your email or sender ID (e.g. name@gmail.com or Discord tag)" value="${prefill?.senderId || ''}" required />
+            </div>
+
+            <!-- Subject -->
+            <div class="gmail-row">
+                <span class="gmail-lbl">Subject</span>
+                <input type="text" id="gmail-subject-input" class="gmail-input" placeholder="Subject" value="${prefill?.subject || ''}" />
+            </div>
+
+            <!-- Message Body -->
+            <div class="gmail-textarea-wrap">
+                <textarea id="gmail-body-input" class="gmail-textarea" placeholder="Write your message here...">${prefill?.body || ''}</textarea>
+            </div>
+
+            <!-- Gmail Bottom Toolbar matching native Google Web client -->
+            <div class="gmail-bottom-bar">
+                <div class="gmail-actions-left">
+                    <div class="gmail-send-group">
+                        <button type="button" class="gmail-send-btn" id="gmail-send-action-btn">
+                            <span>Send</span>
+                            <iconify-icon icon="fluent:chevron-down-12-regular"></iconify-icon>
+                        </button>
+                    </div>
+
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-format" title="Formatting options">
+                        <iconify-icon icon="fluent:text-font-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-sparkle" title="Help me write (AI Polish)">
+                        <iconify-icon icon="fluent:sparkle-20-filled" width="18" height="18" style="color: #1a73e8;"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-attach" title="Attach files">
+                        <iconify-icon icon="fluent:attach-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-link" title="Insert link">
+                        <iconify-icon icon="fluent:link-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-emoji" title="Insert emoji">
+                        <iconify-icon icon="fluent:emoji-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-drive" title="Insert files using Drive">
+                        <iconify-icon icon="logos:google-drive" width="16" height="16"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-photo" title="Insert photo">
+                        <iconify-icon icon="fluent:image-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-lock" title="Toggle confidential mode">
+                        <iconify-icon icon="fluent:lock-shield-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-pen" title="Insert signature">
+                        <iconify-icon icon="fluent:signature-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                    <button type="button" class="gmail-tool-icon-btn" id="gmail-tool-more" title="More options">
+                        <iconify-icon icon="fluent:more-vertical-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                </div>
+
+                <div class="gmail-actions-right">
+                    <button type="button" class="gmail-discard-btn" id="gmail-discard-btn" title="Discard draft">
+                        <iconify-icon icon="fluent:delete-20-regular" width="18" height="18"></iconify-icon>
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    const win = openWindow("Gmail - New Message", contentHTML, gmailIcon, winId, "mail-window");
+    if (!win) return;
+
+    attachMailAppEvents(win);
+    return win;
+}
+
+function attachMailAppEvents(win) {
+    const senderInput = win.querySelector("#gmail-sender-input");
+    const subjectInput = win.querySelector("#gmail-subject-input");
+    const bodyInput = win.querySelector("#gmail-body-input");
+    const sendBtn = win.querySelector("#gmail-send-action-btn");
+    const discardBtn = win.querySelector("#gmail-discard-btn");
+    const ccInput = win.querySelector("#gmail-cc-input");
+    const bccInput = win.querySelector("#gmail-bcc-input");
+
+    // Optional Cc/Bcc toggles
+    const toggleCc = win.querySelector("#gmail-toggle-cc");
+    const toggleBcc = win.querySelector("#gmail-toggle-bcc");
+    const rowCc = win.querySelector("#gmail-row-cc");
+    const rowBcc = win.querySelector("#gmail-row-bcc");
+
+    if (toggleCc && rowCc) {
+        toggleCc.addEventListener("click", () => {
+            rowCc.style.display = rowCc.style.display === "none" ? "flex" : "none";
+            if (rowCc.style.display === "flex" && ccInput) ccInput.focus();
+        });
+    }
+
+    if (toggleBcc && rowBcc) {
+        toggleBcc.addEventListener("click", () => {
+            rowBcc.style.display = rowBcc.style.display === "none" ? "flex" : "none";
+            if (rowBcc.style.display === "flex" && bccInput) bccInput.focus();
+        });
+    }
+
+    // AI polish / Help me write
+    const sparkleBtn = win.querySelector("#gmail-tool-sparkle");
+    if (sparkleBtn && bodyInput) {
+        sparkleBtn.addEventListener("click", () => {
+            const current = bodyInput.value.trim();
+            if (!current) {
+                bodyInput.value = "Hi Josh,\n\nI was checking out your website and CS2 profile! I wanted to reach out regarding:\n\n\nBest regards,\n";
+                if (subjectInput && !subjectInput.value.trim()) {
+                    subjectInput.value = "Connecting from your website portfolio";
+                }
+                showToast("Template inserted! Fill in your message.");
+            } else {
+                bodyInput.value = `Hi Josh,\n\n${current}\n\nBest regards,`;
+                showToast("Message formatted with greetings & sign-off.");
+            }
+            bodyInput.focus();
+        });
+    }
+
+    // Emoji tool
+    const emojiBtn = win.querySelector("#gmail-tool-emoji");
+    if (emojiBtn && bodyInput) {
+        emojiBtn.addEventListener("click", () => {
+            bodyInput.value += " 🎯✉️";
+            bodyInput.focus();
+        });
+    }
+
+    // Send action: sends directly to joshjaison2020@gmail.com
+    if (sendBtn) {
+        sendBtn.addEventListener("click", () => {
+            const senderId = (senderInput && senderInput.value.trim()) || "";
+            const subject = (subjectInput && subjectInput.value.trim()) || "Message from Portfolio";
+            const message = (bodyInput && bodyInput.value.trim()) || "";
+            const ccVal = (ccInput && ccInput.value.trim()) || "";
+            const bccVal = (bccInput && bccInput.value.trim()) || "";
+
+            if (!senderId) {
+                showToast("Please enter your Email or Sender ID");
+                if (senderInput) senderInput.focus();
+                return;
+            }
+            if (!message) {
+                showToast("Please enter a message before sending");
+                if (bodyInput) bodyInput.focus();
+                return;
+            }
+
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = `<span>Sending...</span>`;
+
+            const targetEmail = "joshjaison2020@gmail.com";
+            const formattedBody = `From: ${senderId}\n\nMessage:\n${message}\n\n---\nSent directly to Josh via Web OS Mail`;
+
+            // Prepare mailto URL
+            let mailtoUrl = `mailto:${targetEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(formattedBody)}`;
+            if (ccVal) mailtoUrl += `&cc=${encodeURIComponent(ccVal)}`;
+            if (bccVal) mailtoUrl += `&bcc=${encodeURIComponent(bccVal)}`;
+
+            // Trigger mail client directly
+            try {
+                const a = document.createElement("a");
+                a.href = mailtoUrl;
+                a.style.display = "none";
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => a.remove(), 500);
+            } catch (e) {
+                window.location.href = mailtoUrl;
+            }
+
+            // Silent Firestore backup copy so no message is ever lost
+            try {
+                sendMailMessage({
+                    to: targetEmail,
+                    senderId,
+                    subject,
+                    message
+                }).catch(() => {});
+            } catch (e) {}
+
+            showGmailSnackbar({
+                senderId,
+                subject,
+                message,
+                targetEmail
+            });
+
+            showToast("Opening your email client to send directly to Josh!");
+
+            setTimeout(() => {
+                closeWindow(win);
+            }, 800);
+        });
+    }
+
+    // Discard draft
+    if (discardBtn) {
+        discardBtn.addEventListener("click", () => {
+            if (bodyInput && bodyInput.value.trim().length > 0) {
+                if (!confirm("Discard this message?")) return;
+            }
+            if (subjectInput) subjectInput.value = "";
+            if (bodyInput) bodyInput.value = "";
+            showToast("Draft discarded");
+            closeWindow(win);
+        });
+    }
+}
+
+// Setup Desktop Drop Zone for moving icons across the screen (Admin only)
+export function setupDesktopDropZone() {
+    const desktop = document.getElementById("desktop");
+    const container = document.getElementById("desktopIcons");
+    if (!desktop) return;
+
+    const onDragOver = (e) => {
+        if (currentUser !== "admin") return;
+        if (e.target.closest(".icon[data-is-folder='true']")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+    };
+
+    const onDrop = (e) => {
+        if (currentUser !== "admin") return;
+        if (e.target.closest(".icon[data-is-folder='true']")) return;
+        e.preventDefault();
+        try {
+            const raw = e.dataTransfer.getData("application/json");
+            if (!raw) return;
+            const data = JSON.parse(raw);
+            if (data.source === "desktop" && data.name) {
+                const deskRect = desktop.getBoundingClientRect();
+                const offsetX = data.offsetX || 36;
+                const offsetY = data.offsetY || 36;
+                let x = Math.round(e.clientX - deskRect.left - offsetX);
+                let y = Math.round(e.clientY - deskRect.top - offsetY);
+                x = Math.max(10, Math.min(deskRect.width - 85, x));
+                y = Math.max(10, Math.min(deskRect.height - 110, y));
+
+                currentDesktopPositions[data.name] = { x, y };
+                saveDesktopPositions(currentDesktopPositions);
+                renderDesktop();
+                showToast(`Repositioned "${data.name}"`);
+            }
+        } catch (err) {
+            console.error("Desktop drop error:", err);
+        }
+    };
+
+    desktop.addEventListener("dragover", onDragOver);
+    desktop.addEventListener("drop", onDrop);
+    if (container) {
+        container.addEventListener("dragover", onDragOver);
+        container.addEventListener("drop", onDrop);
+    }
+}
+
+// ==========================================================================
+// COUNTER-STRIKE 2 (CS2) FULLSCREEN COVER VIDEO & LEETIFY DASHBOARD
+// ==========================================================================
+let cs2CurrentView = "video"; // 'video' | 'stats'
+let cs2VideoXTimer = null;
+
+export function saveCs2Config(newConfig) {
+    currentCs2Config = { ...DEFAULT_CS2_CONFIG, ...newConfig };
+    saveLocalOverride("cs2Config", currentCs2Config);
+    if (currentUser === "admin") {
+        saveRemoteConfig("cs2Config", currentCs2Config).catch(err => {
+            console.warn("Firebase CS2 config save warning:", err);
+        });
+    }
+}
+
+export async function syncLeetifyStats(apiKey = null) {
+    const key = apiKey || currentCs2Config.leetifyApiKey || "cc554ec3-3db6-4f54-83b2-c070c40da483";
+    try {
+        const proxyResp = await fetch(`/api/leetify/v3/profile`, {
+            headers: {
+                "_leetify_key": key,
+                "Authorization": `Bearer ${key}`
+            }
+        });
+        if (proxyResp.ok) {
+            const data = await proxyResp.json();
+            if (data) {
+                applyLeetifyTelemetry(data);
+                return { success: true, live: true };
+            }
+        }
+    } catch (e) {
+        // Fallback to public endpoint
+    }
+
+    try {
+        const directResp = await fetch(`https://api-public.os-prod.leetify.com/v3/profile`, {
+            headers: {
+                "_leetify_key": key,
+                "Authorization": `Bearer ${key}`
+            }
+        });
+        if (directResp.ok) {
+            const data = await directResp.json();
+            if (data) {
+                applyLeetifyTelemetry(data);
+                return { success: true, live: true };
+            }
+        }
+    } catch (e) {
+        console.warn("Direct Leetify endpoint note:", e.message);
+    }
+
+    return { success: true, live: false };
+}
+
+function applyLeetifyTelemetry(data) {
+    if (!data) return;
+    if (data.name || data.username) currentCs2Config.playerName = data.name || data.username;
+    if (data.skill_level || data.ratings?.leetify) currentCs2Config.skillRating = Number(data.skill_level || data.ratings?.leetify).toFixed(2);
+    if (data.ranks?.premier) currentCs2Config.premierRating = data.ranks.premier;
+    if (data.ranks?.national) currentCs2Config.nationalRank = data.ranks.national;
+    saveCs2Config(currentCs2Config);
+}
+
+export function openCs2Experience() {
+    // Directive: "also when the user presses the CS2 folder, pause the music"
+    pauseCurrentPlayback();
+
+    let overlay = document.getElementById("cs2-fullscreen-overlay");
+    if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "cs2-fullscreen-overlay";
+        overlay.className = "cs2-fullscreen-overlay";
+        document.body.appendChild(overlay);
+    }
+    overlay.style.display = "flex";
+    cs2CurrentView = "video";
+
+    renderCs2OverlayContent(overlay);
+}
+
+export function closeCs2Experience() {
+    if (cs2VideoXTimer) {
+        clearTimeout(cs2VideoXTimer);
+        cs2VideoXTimer = null;
+    }
+    const overlay = document.getElementById("cs2-fullscreen-overlay");
+    if (overlay) {
+        const video = overlay.querySelector("video");
+        if (video) {
+            video.pause();
+            video.src = "";
+        }
+        const iframe = overlay.querySelector("iframe");
+        if (iframe) {
+            iframe.src = "";
+        }
+        overlay.style.display = "none";
+        overlay.innerHTML = "";
+    }
+}
+
+function renderCs2OverlayContent(overlay) {
+    overlay.innerHTML = "";
+    if (cs2VideoXTimer) {
+        clearTimeout(cs2VideoXTimer);
+        cs2VideoXTimer = null;
+    }
+
+    // Top-right X button: transparent, appearing after 3s in video mode
+    const xBtn = document.createElement("button");
+    xBtn.id = "cs2-top-x-btn";
+    xBtn.innerHTML = "✕";
+
+    if (cs2CurrentView === "video") {
+        xBtn.className = "cs2-x-btn cs2-x-btn-transparent cs2-x-video-delayed";
+        xBtn.title = "View CS2 & Leetify Stats (Skip Cover Video)";
+        cs2VideoXTimer = setTimeout(() => {
+            xBtn.classList.add("is-visible");
+        }, 3000);
+        xBtn.addEventListener("click", () => {
+            if (cs2VideoXTimer) clearTimeout(cs2VideoXTimer);
+            cs2CurrentView = "stats";
+            renderCs2OverlayContent(overlay);
+        });
+    } else {
+        xBtn.className = "cs2-x-btn cs2-x-btn-transparent is-visible";
+        xBtn.title = "Close CS2 Dashboard and Return to Desktop";
+        xBtn.addEventListener("click", () => {
+            closeCs2Experience();
+        });
+    }
+
+    overlay.appendChild(xBtn);
+
+    if (cs2CurrentView === "video") {
+        renderCs2VideoView(overlay);
+    } else {
+        renderCs2StatsView(overlay);
+    }
+}
+
+function renderCs2VideoView(overlay) {
+    const videoWrap = document.createElement("div");
+    videoWrap.className = "cs2-video-view";
+
+    const videoUrl = currentCs2Config.videoUrl || DEFAULT_CS2_CONFIG.videoUrl;
+    const isYT = isYouTubeTrack({ src: videoUrl });
+    const ytId = isYT ? extractYouTubeId(videoUrl) : null;
+    const isDrive = isGoogleDriveTrack({ src: videoUrl }) || (typeof videoUrl === "string" && (videoUrl.includes("drive.google.com") || videoUrl.includes("docs.google.com")));
+    const driveId = isDrive ? extractGoogleDriveId(videoUrl) : null;
+
+    let mediaHTML = "";
+    if (isYT && ytId) {
+        // YouTube embed without controls or branding
+        mediaHTML = `
+            <div class="cs2-video-host">
+                <iframe id="cs2-yt-video-frame" src="https://www.youtube.com/embed/${ytId}?autoplay=1&controls=0&mute=1&loop=1&playlist=${ytId}&rel=0&modestbranding=1&iv_load_policy=3&disablekb=1&playsinline=1" allow="autoplay; fullscreen" allowfullscreen></iframe>
+            </div>
+        `;
+    } else {
+        // Direct HTML5 cover video (streamed via proxy for Google Drive to eliminate Google Drive headers, seeker, and open-in-new-window icons)
+        const directSrc = (isDrive && driveId) ? `/api/drive-video?id=${encodeURIComponent(driveId)}` : videoUrl;
+        mediaHTML = `
+            <div class="cs2-video-host">
+                <video id="cs2-active-video" class="cs2-cover-video-element" src="${directSrc}" autoplay loop muted playsinline preload="auto"></video>
+            </div>
+        `;
+    }
+
+    videoWrap.innerHTML = mediaHTML;
+    overlay.appendChild(videoWrap);
+
+    const videoEl = videoWrap.querySelector("video");
+    if (videoEl) {
+        videoEl.play().catch(e => {
+            console.warn("Autoplay audio policy fallback:", e);
+            videoEl.muted = true;
+            videoEl.play().catch(() => {});
+        });
+        videoEl.addEventListener("error", () => {
+            if (isDrive && driveId && !videoEl.dataset.fallbackTried) {
+                videoEl.dataset.fallbackTried = "true";
+                videoEl.src = `https://drive.usercontent.google.com/download?id=${driveId}&export=download&confirm=t`;
+                videoEl.play().catch(() => {});
+            }
+        });
+        videoEl.addEventListener("ended", () => {
+            cs2CurrentView = "stats";
+            renderCs2OverlayContent(overlay);
+        });
+    }
+}
+
+export function getPremierRatingColor(rating) {
+    if (!rating) return "#c084fc";
+    const num = typeof rating === "number" ? rating : parseInt(String(rating).replace(/[^0-9]/g, ""), 10);
+    if (isNaN(num)) return "#c084fc";
+    if (num < 5000) return "#8e9297"; // 0-4,999 Grey
+    if (num < 10000) return "#5dade2"; // 5,000-9,999 Light Blue
+    if (num < 15000) return "#2563eb"; // 10,000-14,999 Dark Blue (12k is dark blue)
+    if (num < 20000) return "#c084fc"; // 15,000-19,999 Purple (15k is purple)
+    if (num < 25000) return "#ec4899"; // 20,000-24,999 Pink
+    if (num < 30000) return "#ef4444"; // 25,000-29,999 Red
+    return "#eab308"; // 30,000+ Gold
+}
+
+function renderCs2StatsView(overlay) {
+    const statsWrap = document.createElement("div");
+    statsWrap.className = "cs2-stats-view cs2-theme-orange";
+
+    const playerName = currentCs2Config.playerName || "SPIKETONES007";
+    const premierRating = currentCs2Config.premierRating ? Number(currentCs2Config.premierRating).toLocaleString() : "15,003";
+    const leetifyUrl = currentCs2Config.leetifyUrl || "https://leetify.com/app/profile/76561199580350164";
+    const crosshairCode = currentCs2Config.crosshairCode || "CSGO-SL7LH-GOWPk-mV2m3-bO9QG-RcCcO";
+
+    const ranks = currentCs2Config.ranksOverview || DEFAULT_CS2_CONFIG.ranksOverview;
+    const steam = currentCs2Config.steamDetails || DEFAULT_CS2_CONFIG.steamDetails;
+    const club = currentCs2Config.club || DEFAULT_CS2_CONFIG.club;
+    const party = currentCs2Config.partySize || DEFAULT_CS2_CONFIG.partySize;
+    const seasons = currentCs2Config.seasons || DEFAULT_CS2_CONFIG.seasons;
+    const perfRadar = currentCs2Config.performanceRadar || DEFAULT_CS2_CONFIG.performanceRadar;
+    const benchRadar = currentCs2Config.benchmarkRadar || DEFAULT_CS2_CONFIG.benchmarkRadar;
+    const attr = currentCs2Config.attributes || DEFAULT_CS2_CONFIG.attributes;
+    const recentMatch = currentCs2Config.recentMatch || DEFAULT_CS2_CONFIG.recentMatch;
+    const matchesList = currentCs2Config.matches || DEFAULT_CS2_CONFIG.matches;
+
+    // Build Round-by-Round Bar Chart HTML for latest match
+    const rounds = recentMatch.rounds || [
+        { r: 1, val: 5.2 }, { r: 2, val: 3.8 }, { r: 3, val: 1.5 }, { r: 4, val: 0.6 },
+        { r: 5, val: 0.2 }, { r: 6, val: -1.4 }, { r: 7, val: -2.8 }, { r: 8, val: -4.1 },
+        { r: 9, val: 1.9 }, { r: 10, val: 6.66 }
+    ];
+    const badges = ["BI", "EE", "MR", "ZX", "SE", "OB", "SP", "19", "SC", "TK"];
+
+    const roundBarsHTML = rounds.map((rd, i) => {
+        const isPos = rd.val >= 0;
+        const heightPx = Math.min(Math.abs(rd.val) * 8 + 6, 52);
+        const barClass = isPos ? "cs2-bar-pos" : "cs2-bar-neg";
+        const badgeTxt = badges[i % badges.length];
+        return `
+            <div class="cs2-round-bar-unit" title="Round ${rd.r}: ${isPos ? '+' : ''}${rd.val}%">
+                <div class="cs2-round-bar-track ${isPos ? 'pos' : 'neg'}">
+                    <div class="cs2-bar-rect ${barClass}" style="height: ${heightPx}px;"></div>
+                </div>
+                <div class="cs2-round-tag-initial">${badgeTxt}</div>
+            </div>
+        `;
+    }).join("");
+
+    // SVG Charts
+    const triangleRadarSVG = generateTriangleRadarSVG(perfRadar, benchRadar);
+    const activityBarsSVG = generateActivityBarsSVG();
+    const rankClimbSVG = generateRankClimbSVG();
+
+    // Seasons HTML
+    const seasonsHTML = seasons.map(s => `
+        <div class="cs2-season-card ${s.active ? 'active' : ''}">
+            <div class="cs2-season-header">
+                <div>
+                    <span class="cs2-season-name">${escapeHTML(s.name)}</span>
+                    ${s.active ? '<span class="cs2-pill-badge" style="margin-left: 8px; background: rgba(255,119,0,0.2); color: #ffaa33; border: 1px solid rgba(255,119,0,0.4);">ACTIVE</span>' : ''}
+                </div>
+                <span class="cs2-season-dates">${escapeHTML(s.dates)}</span>
+            </div>
+            <div class="cs2-season-metrics-row">
+                <div class="cs2-season-metric-cell">
+                    <span class="cs2-season-metric-lbl">Matches</span>
+                    <span class="cs2-season-metric-val">${s.matches}</span>
+                </div>
+                <div class="cs2-season-metric-cell">
+                    <span class="cs2-season-metric-lbl">Win Rate</span>
+                    <span class="cs2-season-metric-val highlight">${escapeHTML(s.winRate)}</span>
+                </div>
+                <div class="cs2-season-metric-cell">
+                    <span class="cs2-season-metric-lbl">K/D</span>
+                    <span class="cs2-season-metric-val">${escapeHTML(s.kd)}</span>
+                </div>
+                ${s.active && s.premierCurrent ? `
+                <div class="cs2-season-metric-cell">
+                    <span class="cs2-season-metric-lbl">Premier Current</span>
+                    <span class="cs2-season-metric-val" style="color: ${getPremierRatingColor(s.premierCurrent)};">${escapeHTML(s.premierCurrent)}</span>
+                </div>` : ''}
+            </div>
+            <div class="cs2-season-ranks-sub">
+                <span>Range: <strong>${escapeHTML(s.premierMin)}</strong> – <strong style="color: ${getPremierRatingColor(s.premierMax)};">${escapeHTML(s.premierMax)}</strong></span>
+                <span>Comp: <strong>${escapeHTML(s.comp)}</strong></span>
+                <span>Wingman: <strong>${escapeHTML(s.wingman)}</strong></span>
+            </div>
+        </div>
+    `).join("");
+
+    // Initial matches grid
+    const initialMatchesHTML = renderMatchesGridHTML(matchesList);
+
+    statsWrap.innerHTML = `
+        <!-- Full-Screen 2-Column Dashboard Body (No Header Bar) -->
+        <div class="cs2-dash-body cs2-no-header">
+            
+            <!-- COLUMN 1: Standing Agent Card & Left Sidebar -->
+            <div class="cs2-col-hero">
+                
+                <!-- Standing Agent Card with Mouse Tilt -->
+                <div class="cs2-agent-card-wrapper" id="cs2-agent-3d-wrapper">
+                    <div class="cs2-agent-card-3d">
+                        <div class="cs2-card-glare"></div>
+
+                        <div class="cs2-agent-image-wrap">
+                            <img src="/assets/cs2_agent_phoenix.png" alt="CS2 Phoenix Agent" class="cs2-agent-img" />
+                            <div class="cs2-agent-gradient"></div>
+                        </div>
+                        
+                        <div class="cs2-hero-profile-box">
+                            <div class="cs2-hero-avatar-row">
+                                <div class="cs2-hero-avatar">
+                                    <img src="/assets/cs2_agent_phoenix.png" alt="Player" />
+                                </div>
+                                <div>
+                                    <div class="cs2-hero-gamertag">
+                                        <span>${escapeHTML(playerName)}</span>
+                                        <iconify-icon icon="fluent:checkmark-circle-16-filled" class="cs2-verified-tick" title="Leetify Verified Profile"></iconify-icon>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Ranks Overview Card -->
+                <div class="cs2-left-section-card">
+                    <div class="cs2-ranks-list">
+                        <div class="cs2-rank-row-item">
+                            <div class="cs2-rank-name-wrap">
+                                <iconify-icon icon="fluent:trophy-20-regular" style="color: ${getPremierRatingColor(premierRating)}; font-size: 16px;"></iconify-icon>
+                                <span class="cs2-rank-name">Premier</span>
+                            </div>
+                            <span class="cs2-rank-badge-val premier" style="color: ${getPremierRatingColor(premierRating)};">${premierRating}</span>
+                        </div>
+                        <div class="cs2-rank-row-item">
+                            <div class="cs2-rank-name-wrap">
+                                <iconify-icon icon="fluent:target-arrow-20-regular" style="color: #ffaa33; font-size: 16px;"></iconify-icon>
+                                <span class="cs2-rank-name">Competitive</span>
+                            </div>
+                            <span class="cs2-rank-badge-val">${escapeHTML(ranks.competitive || 'Silver Elite Master')}</span>
+                        </div>
+                        <div class="cs2-rank-row-item">
+                            <div class="cs2-rank-name-wrap">
+                                <iconify-icon icon="fluent:people-team-20-regular" style="color: #2ed573; font-size: 16px;"></iconify-icon>
+                                <span class="cs2-rank-name">Wingman</span>
+                            </div>
+                            <span class="cs2-rank-badge-val">${escapeHTML(ranks.wingman || 'Gold Nova II')}</span>
+                        </div>
+                    </div>
+                    <div class="cs2-map-ranks-pills">
+                        ${(ranks.mapRanks || []).map(m => `
+                            <div class="cs2-map-pill-item">
+                                <span style="color: rgba(255,255,255,0.9); font-weight: 700;">${escapeHTML(m.map)}:</span> ${escapeHTML(m.rank)}
+                            </div>
+                        `).join("")}
+                    </div>
+                </div>
+
+                <!-- Steam Profile Card -->
+                <div class="cs2-left-section-card">
+                    <div style="display: flex; justify-content: flex-end;">
+                        <span class="cs2-left-card-tag">Level ${steam.level || 20}</span>
+                    </div>
+                    <div class="cs2-steam-stats-grid">
+                        <div class="cs2-steam-stat-cell">
+                            <span class="cs2-steam-stat-lbl">Matches</span>
+                            <span class="cs2-steam-stat-num">${Number(steam.matches || 1315).toLocaleString()}</span>
+                        </div>
+                        <div class="cs2-steam-stat-cell">
+                            <span class="cs2-steam-stat-lbl">Hours</span>
+                            <span class="cs2-steam-stat-num">${Number(steam.hours || 844).toLocaleString()} hrs</span>
+                        </div>
+                        <div class="cs2-steam-stat-cell">
+                            <span class="cs2-steam-stat-lbl">Account Age</span>
+                            <span class="cs2-steam-stat-num">${escapeHTML(steam.age || '3 years')}</span>
+                        </div>
+                        <div class="cs2-steam-stat-cell">
+                            <span class="cs2-steam-stat-lbl">Last Active</span>
+                            <span class="cs2-steam-stat-num">${escapeHTML(steam.lastMatch || 'Recent')}</span>
+                        </div>
+                    </div>
+                    <a href="https://steamcommunity.com/profiles/${escapeHTML(steam.id || '76561199580350164')}" target="_blank" rel="noopener noreferrer" class="cs2-steam-link-btn">
+                        <iconify-icon icon="simple-icons:steam"></iconify-icon>
+                        <span>Steam Community Profile ↗</span>
+                    </a>
+                </div>
+
+                <!-- Active Crosshair Card -->
+                <div class="cs2-crosshair-card">
+                    <div class="cs2-crosshair-preview-box" title="CS2 In-Game Crosshair: Tiny Red Dot Reticle">
+                        <div class="cs2-crosshair-backdrop-dust"></div>
+                        <div class="cs2-crosshair-reticle-wrap">
+                            <svg width="22" height="22" viewBox="0 0 22 22" fill="none" class="cs2-tiny-crosshair-svg">
+                                <rect x="10.25" y="4.5" width="1.5" height="4.5" fill="#ff0000" />
+                                <rect x="10.25" y="13" width="1.5" height="4.5" fill="#ff0000" />
+                                <rect x="4.5" y="10.25" width="4.5" height="1.5" fill="#ff0000" />
+                                <rect x="13" y="10.25" width="4.5" height="1.5" fill="#ff0000" />
+                                <rect x="10.25" y="10.25" width="1.5" height="1.5" fill="#ff0000" />
+                            </svg>
+                        </div>
+                    </div>
+                    <div class="cs2-crosshair-code-box">
+                        <code id="cs2-crosshair-code-display" title="${escapeHTML(crosshairCode)}">${escapeHTML(crosshairCode)}</code>
+                        <button class="cs2-copy-crosshair-btn" id="cs2-copy-crosshair-btn" title="Copy CS2 Crosshair Code">
+                            <iconify-icon icon="fluent:copy-20-regular"></iconify-icon>
+                            <span>Copy</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Club & Party Size Card -->
+                <div class="cs2-left-section-card">
+                    <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                        <span class="cs2-left-card-tag">${escapeHTML(club.tag || '007 [L7] 007')}</span>
+                    </div>
+                    <div class="cs2-party-bars">
+                        <div class="cs2-party-row">
+                            <span class="cs2-party-lbl">Solo Queue</span>
+                            <span class="cs2-party-pct">${party.solo || 90}%</span>
+                        </div>
+                        <div class="cs2-party-bar-track">
+                            <div class="cs2-party-bar-fill" style="width: ${party.solo || 90}%;"></div>
+                        </div>
+                        <div class="cs2-party-row" style="margin-top: 6px;">
+                            <span class="cs2-party-lbl">2-3 Stack</span>
+                            <span class="cs2-party-pct">${party.stack || 10}%</span>
+                        </div>
+                        <div class="cs2-party-bar-track">
+                            <div class="cs2-party-bar-fill" style="width: ${party.stack || 10}%; background: #00e5ff;"></div>
+                        </div>
+                        <div class="cs2-party-row" style="margin-top: 6px;">
+                            <span class="cs2-party-lbl">5 Stack Full</span>
+                            <span class="cs2-party-pct">${party.full || 0}%</span>
+                        </div>
+                        <div class="cs2-party-bar-track">
+                            <div class="cs2-party-bar-fill" style="width: ${party.full || 0}%;"></div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- COLUMN 2: Full-Screen Telemetry Main Area -->
+            <div class="cs2-col-main">
+
+                <!-- Seasons Telemetry -->
+                <div>
+                    <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+                        <a href="${leetifyUrl}" target="_blank" rel="noopener noreferrer" style="font-size: 11.5px; color: #ffaa33; text-decoration: none; font-weight: 700;">
+                            View full Leetify profile ↗
+                        </a>
+                    </div>
+                    <div class="cs2-season-cards-grid">
+                        ${seasonsHTML}
+                    </div>
+                </div>
+
+                <!-- Performance Matrix & Triangular Radar + 9 Attributes -->
+                <div>
+                    <div class="cs2-perf-radar-card" style="margin-top: 4px;">
+                        
+                        <!-- Left Subcolumn: Triangle Radar -->
+                        <div class="cs2-triangle-radar-col">
+                            <div class="cs2-triangle-radar-svg-box">
+                                ${triangleRadarSVG}
+                            </div>
+                            <div class="cs2-radar-legend-bar">
+                                <div class="cs2-legend-pill">
+                                    <span class="cs2-legend-square" style="background: #ff7700;"></span>
+                                    <span>You (${escapeHTML(playerName)})</span>
+                                </div>
+                                <div class="cs2-legend-pill">
+                                    <span class="cs2-legend-square" style="background: #a855f7;"></span>
+                                    <span>25k+ Avg</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Right Subcolumn: 9-Attributes Matrix -->
+                        <div class="cs2-attributes-matrix">
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Crosshair Placement</span>
+                                    <iconify-icon icon="fluent:target-arrow-16-regular" style="color: #ffaa33;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score orange">${escapeHTML(attr.preaim || '8.84°')}</div>
+                                <div class="cs2-attr-sub">vs 8.42° avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Reaction Time</span>
+                                    <iconify-icon icon="fluent:timer-16-regular" style="color: #00e5ff;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score cyan">${escapeHTML(attr.reactionTime || '518ms')}</div>
+                                <div class="cs2-attr-sub">vs 524ms avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Enemy Accuracy</span>
+                                    <iconify-icon icon="fluent:arrow-trending-16-regular" style="color: #2ed573;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score high">${escapeHTML(attr.accuracy || '38.7%')}</div>
+                                <div class="cs2-attr-sub">vs 35.6% avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Headshot Accuracy</span>
+                                    <iconify-icon icon="fluent:target-16-regular" style="color: #ff4757;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score">${escapeHTML(attr.headshot || '17.3%')}</div>
+                                <div class="cs2-attr-sub">vs 19.8% avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Counter-Strafing</span>
+                                    <iconify-icon icon="fluent:arrow-swap-16-regular" style="color: #2ed573;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score high">${escapeHTML(attr.counterStrafing || '75.1%')}</div>
+                                <div class="cs2-attr-sub">vs 73.2% avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Spray Accuracy</span>
+                                    <iconify-icon icon="fluent:flash-16-regular" style="color: #ffaa33;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score orange">${escapeHTML(attr.sprayAccuracy || '42.8%')}</div>
+                                <div class="cs2-attr-sub">vs 41.5% avg</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">HE Grenade DMG</span>
+                                    <iconify-icon icon="fluent:flame-16-regular" style="color: #ff9900;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score">${escapeHTML(attr.heDamage || '9.51')}</div>
+                                <div class="cs2-attr-sub">avg per match</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Flashbang Duration</span>
+                                    <iconify-icon icon="fluent:lightbulb-16-regular" style="color: #e056fd;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score">${escapeHTML(attr.flashDuration || '2.12s')}</div>
+                                <div class="cs2-attr-sub">blind time per enemy</div>
+                            </div>
+                            <div class="cs2-attr-tile">
+                                <div class="cs2-attr-header">
+                                    <span class="cs2-attr-title">Trade Kill Opp.</span>
+                                    <iconify-icon icon="fluent:shield-16-regular" style="color: #00e5ff;"></iconify-icon>
+                                </div>
+                                <div class="cs2-attr-score cyan">${escapeHTML(attr.tradeKillOpp || '0.41')}</div>
+                                <div class="cs2-attr-sub">traded: ${escapeHTML(attr.tradedDeaths || '56.1%')}</div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Recent Matches Grid with Mode Filter -->
+                <div>
+                    <div class="cs2-matches-filter-row" style="margin-top: 14px; margin-bottom: 10px;">
+                        <div class="cs2-mode-filter-pills">
+                            <button class="cs2-mode-pill active" data-mode="all">All</button>
+                            <button class="cs2-mode-pill" data-mode="premier">Premier</button>
+                            <button class="cs2-mode-pill" data-mode="competitive">Competitive</button>
+                            <button class="cs2-mode-pill" data-mode="wingman">Wingman</button>
+                        </div>
+                    </div>
+                    <div class="cs2-matches-grid-v2" id="cs2-matches-grid-container">
+                        ${initialMatchesHTML}
+                    </div>
+                </div>
+
+                <!-- Activity & Premier Progression Duo Grid -->
+                <div class="cs2-charts-duo-grid" style="margin-top: 14px;">
+                    <!-- Chart 1: Activity & Win/Loss -->
+                    <div class="cs2-chart-card">
+                        <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                            <span style="font-size: 11px; font-weight: 700; color: #2ed573;">84% Win Rate (163G)</span>
+                        </div>
+                        <div class="cs2-chart-svg-wrap">
+                            ${activityBarsSVG}
+                        </div>
+                    </div>
+
+                    <!-- Chart 2: Premier Rating Climb -->
+                    <div class="cs2-chart-card">
+                        <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                            <span style="font-size: 11px; font-weight: 700; color: #c084fc;">Peak: 15,118</span>
+                        </div>
+                        <div class="cs2-chart-svg-wrap">
+                            ${rankClimbSVG}
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Round Momentum Deep Dive -->
+                <div class="cs2-momentum-card">
+                    <div class="cs2-momentum-top">
+                        <div class="cs2-momentum-impact-pill">+6.66% Leetify Impact</div>
+                    </div>
+                    <div class="cs2-round-chart-wrap">
+                        <div class="cs2-round-chart-y">
+                            <span>+8%</span>
+                            <span>0%</span>
+                            <span>-8%</span>
+                        </div>
+                        <div class="cs2-round-bars-container">
+                            <div class="cs2-zero-line"></div>
+                            ${roundBarsHTML}
+                        </div>
+                    </div>
+                    <div class="cs2-halves-split-footer">
+                        <div class="cs2-half-cell">
+                            <div class="cs2-half-info">
+                                <span class="cs2-side-icon t-side">T</span>
+                                <span class="cs2-side-title">T side</span>
+                            </div>
+                            <span class="cs2-half-val">${escapeHTML(recentMatch.tSide || '+5.52%')}</span>
+                        </div>
+                        <div class="cs2-half-cell">
+                            <div class="cs2-half-info">
+                                <span class="cs2-side-icon ct-side">CT</span>
+                                <span class="cs2-side-title">CT side</span>
+                            </div>
+                            <span class="cs2-half-val highlight-ct">${escapeHTML(recentMatch.ctSide || '+7.9%')}</span>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+    `;
+
+    overlay.appendChild(statsWrap);
+
+    // Attach 3D Card mouse-tilt physics
+    const agentWrapper = statsWrap.querySelector("#cs2-agent-3d-wrapper");
+    if (agentWrapper) {
+        attachAgentCard3dPhysics(agentWrapper);
+    }
+
+    // Bind Replay Cover Video Button
+    const replayBtn = statsWrap.querySelector("#cs2-replay-cover-btn");
+    if (replayBtn) {
+        replayBtn.addEventListener("click", () => {
+            cs2CurrentView = "video";
+            renderCs2OverlayContent(overlay);
+        });
+    }
+
+    // Bind Copy Crosshair Button
+    const copyCrosshairBtn = statsWrap.querySelector("#cs2-copy-crosshair-btn");
+    if (copyCrosshairBtn) {
+        copyCrosshairBtn.addEventListener("click", () => {
+            const code = currentCs2Config.crosshairCode || "CSGO-SL7LH-GOWPk-mV2m3-bO9QG-RcCcO";
+            navigator.clipboard.writeText(code).then(() => {
+                copyCrosshairBtn.innerHTML = `<iconify-icon icon="fluent:checkmark-20-regular"></iconify-icon> <span>Copied!</span>`;
+                setTimeout(() => {
+                    copyCrosshairBtn.innerHTML = `<iconify-icon icon="fluent:copy-20-regular"></iconify-icon> <span>Copy</span>`;
+                }, 2000);
+                showToast("CS2 Crosshair code copied to clipboard!");
+            }).catch(() => {
+                showToast("Crosshair: " + code);
+            });
+        });
+    }
+
+    // Bind Matches Mode Filter Pills
+    const modePills = statsWrap.querySelectorAll(".cs2-mode-pill");
+    modePills.forEach(pill => {
+        pill.addEventListener("click", () => {
+            modePills.forEach(p => p.classList.remove("active"));
+            pill.classList.add("active");
+            const mode = pill.getAttribute("data-mode");
+            const container = statsWrap.querySelector("#cs2-matches-grid-container");
+            if (container) {
+                let filtered = matchesList;
+                if (mode === "competitive") {
+                    filtered = matchesList.filter(m => (m.map || "").includes("inferno") || (m.map || "").includes("mirage"));
+                } else if (mode === "wingman") {
+                    filtered = matchesList.filter(m => (m.score || "").startsWith("9"));
+                }
+                container.innerHTML = renderMatchesGridHTML(filtered);
+            }
+        });
+    });
+
+    // Bind Nav Tabs
+    const navTabs = statsWrap.querySelectorAll(".cs2-nav-tab");
+    navTabs.forEach(tab => {
+        tab.addEventListener("click", () => {
+            navTabs.forEach(t => t.classList.remove("active"));
+            tab.classList.add("active");
+        });
+    });
+}
+
+// 3D Agent Card Physics: "the other corner of the card comes towards the screen, due to the weight of the mouse, like a 3d card"
+function attachAgentCard3dPhysics(wrapper) {
+    const card = wrapper.querySelector(".cs2-agent-card-3d");
+    const glare = wrapper.querySelector(".cs2-card-glare");
+    if (!card) return;
+
+    let rafId = null;
+
+    const onMouseMove = (e) => {
+        const rect = card.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const cx = rect.width / 2;
+        const cy = rect.height / 2;
+
+        const dx = (x - cx) / cx; // -1 to 1
+        const dy = (y - cy) / cy; // -1 to 1
+
+        const maxTilt = 16;
+        // Pushing top pushes top inward into the screen (rotX > 0), causing bottom-opposite corner to tilt forward towards viewer
+        // Pushing left pushes left inward into the screen (rotY < 0), causing right-opposite corner to tilt forward towards viewer
+        const rotX = dy * maxTilt;
+        const rotY = -dx * maxTilt;
+
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(() => {
+            card.style.transform = `perspective(1000px) rotateX(${rotX.toFixed(2)}deg) rotateY(${rotY.toFixed(2)}deg) scale3d(1.025, 1.025, 1.025)`;
+            if (glare) {
+                const px = ((x / rect.width) * 100).toFixed(1);
+                const py = ((y / rect.height) * 100).toFixed(1);
+                glare.style.background = `radial-gradient(circle at ${px}% ${py}%, rgba(255, 255, 255, 0.35) 0%, rgba(255, 140, 0, 0.15) 45%, transparent 70%)`;
+                glare.style.opacity = "1";
+            }
+        });
+    };
+
+    const onMouseLeave = () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        card.style.transform = "perspective(1000px) rotateX(0deg) rotateY(0deg) scale3d(1, 1, 1)";
+        if (glare) glare.style.opacity = "0";
+    };
+
+    card.addEventListener("mousemove", onMouseMove);
+    card.addEventListener("mouseleave", onMouseLeave);
+}
+
+// Matches Grid HTML Generator
+function renderMatchesGridHTML(matchesList) {
+    if (!matchesList || matchesList.length === 0) {
+        return `<div style="color: rgba(255,255,255,0.4); padding: 16px; font-size: 12px;">No matches found for selected category.</div>`;
+    }
+    return matchesList.map(m => {
+        const isWin = (m.result || "").toUpperCase() === "WIN";
+        const outcomeClass = isWin ? "win" : "loss";
+        const ratingVal = m.leetify || "+10.0";
+        const isPosRating = !ratingVal.startsWith("-");
+        const ratingClass = isPosRating ? "pos" : "neg";
+        const mapClean = (m.map || "anubis").replace(/^de_/, "");
+
+        return `
+            <div class="cs2-match-tile-v2">
+                <div class="cs2-match-tile-top">
+                    <span class="cs2-match-map-title">${escapeHTML(mapClean)}</span>
+                    <span class="cs2-match-outcome-tag ${outcomeClass}">${isWin ? 'WIN' : 'LOSS'}</span>
+                </div>
+                <div class="cs2-match-tile-body">
+                    <div class="cs2-match-score-row">
+                        <span class="cs2-match-score-big">${escapeHTML(m.score || '13 : 10')}</span>
+                        <span class="cs2-match-rating-badge ${ratingClass}">${escapeHTML(ratingVal)}</span>
+                    </div>
+                    <div class="cs2-match-stats-row">
+                        <div class="cs2-match-stat-col">
+                            <span class="cs2-m-lbl">K/D</span>
+                            <span class="cs2-m-val">${escapeHTML(m.kd || '1.5')}</span>
+                        </div>
+                        <div class="cs2-match-stat-col">
+                            <span class="cs2-m-lbl">HS%</span>
+                            <span class="cs2-m-val">${escapeHTML(m.hs || '60%')}</span>
+                        </div>
+                        <div class="cs2-match-stat-col">
+                            <span class="cs2-m-lbl">Accuracy</span>
+                            <span class="cs2-m-val">${escapeHTML(m.accuracy || '39%')}</span>
+                        </div>
+                        <div class="cs2-match-stat-col">
+                            <span class="cs2-m-lbl">Preaim</span>
+                            <span class="cs2-m-val">${escapeHTML(m.preaim || '7.5°')}</span>
+                        </div>
+                    </div>
+                    <div class="cs2-match-tile-footer">
+                        <span>Premier 5v5</span>
+                        <span>${escapeHTML(m.date || 'Recent')}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join("");
+}
+
+// SVG Triangular Radar Chart (Aim, Utility, Positioning)
+function generateTriangleRadarSVG(perf, bench) {
+    const size = 260;
+    const cx = 130;
+    const cy = 115;
+    const R = 75;
+
+    // Triangle vertices (Aim = Top, Utility = Bottom Right, Positioning = Bottom Left)
+    const angles = [-Math.PI / 2, Math.PI / 6, 5 * Math.PI / 6];
+
+    // Grid Levels: 33%, 66%, 100%
+    const levels = [0.33, 0.66, 1.0];
+    const gridPolys = levels.map(lvl => {
+        const pts = angles.map(a => `${(cx + R * lvl * Math.cos(a)).toFixed(1)},${(cy + R * lvl * Math.sin(a)).toFixed(1)}`).join(" ");
+        return `<polygon points="${pts}" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1" stroke-dasharray="${lvl < 1 ? '2,2' : 'none'}"/>`;
+    }).join("");
+
+    // Spokes from center
+    const spokes = angles.map(a => {
+        return `<line x1="${cx}" y1="${cy}" x2="${(cx + R * Math.cos(a)).toFixed(1)}" y2="${(cy + R * Math.sin(a)).toFixed(1)}" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>`;
+    }).join("");
+
+    // Benchmark Polygon (25k+ Avg: Aim 92, Utility 65, Positioning 78)
+    const bAim = (bench.aim || 92) / 100;
+    const bUtil = (bench.utility || 65) / 100;
+    const bPos = (bench.positioning || 78) / 100;
+    const bPts = [
+        `${cx},${(cy - R * bAim).toFixed(1)}`,
+        `${(cx + R * bUtil * Math.cos(angles[1])).toFixed(1)},${(cy + R * bUtil * Math.sin(angles[1])).toFixed(1)}`,
+        `${(cx + R * bPos * Math.cos(angles[2])).toFixed(1)},${(cy + R * bPos * Math.sin(angles[2])).toFixed(1)}`
+    ].join(" ");
+
+    // Player Polygon (You: Aim 82.4, Utility 40.4, Positioning 65.9)
+    const pAim = (perf.aim || 82.4) / 100;
+    const pUtil = (perf.utility || 40.4) / 100;
+    const pPos = (perf.positioning || 65.9) / 100;
+    const pPts = [
+        `${cx},${(cy - R * pAim).toFixed(1)}`,
+        `${(cx + R * pUtil * Math.cos(angles[1])).toFixed(1)},${(cy + R * pUtil * Math.sin(angles[1])).toFixed(1)}`,
+        `${(cx + R * pPos * Math.cos(angles[2])).toFixed(1)},${(cy + R * pPos * Math.sin(angles[2])).toFixed(1)}`
+    ].join(" ");
+
+    return `
+        <svg width="100%" height="220" viewBox="0 0 ${size} 220" class="cs2-triangle-radar-svg">
+            <defs>
+                <linearGradient id="trianglePlayerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#ff7700" stop-opacity="0.55"/>
+                    <stop offset="100%" stop-color="#ff9900" stop-opacity="0.2"/>
+                </linearGradient>
+            </defs>
+            ${gridPolys}
+            ${spokes}
+            
+            <!-- Benchmark 25k Polygon -->
+            <polygon points="${bPts}" fill="rgba(168, 85, 247, 0.14)" stroke="#a855f7" stroke-width="1.8" stroke-dasharray="4,3" />
+
+            <!-- Player Polygon -->
+            <polygon points="${pPts}" fill="url(#trianglePlayerGrad)" stroke="#ff7700" stroke-width="2.5" />
+            
+            <!-- Player Points Dots -->
+            <circle cx="${cx}" cy="${(cy - R * pAim).toFixed(1)}" r="4" fill="#ff7700" stroke="#ffffff" stroke-width="1.5" />
+            <circle cx="${(cx + R * pUtil * Math.cos(angles[1])).toFixed(1)}" cy="${(cy + R * pUtil * Math.sin(angles[1])).toFixed(1)}" r="4" fill="#ff7700" stroke="#ffffff" stroke-width="1.5" />
+            <circle cx="${(cx + R * pPos * Math.cos(angles[2])).toFixed(1)}" cy="${(cy + R * pPos * Math.sin(angles[2])).toFixed(1)}" r="4" fill="#ff7700" stroke="#ffffff" stroke-width="1.5" />
+
+            <!-- Vertex Labels -->
+            <text x="${cx}" y="20" fill="#ffffff" font-size="11" font-weight="800" text-anchor="middle">AIM</text>
+            <text x="${cx}" y="33" fill="#ffaa33" font-size="10" font-weight="800" text-anchor="middle">${perf.aim || 82.4}</text>
+
+            <text x="${(cx + R + 14).toFixed(1)}" y="${cy + 52}" fill="#ffffff" font-size="11" font-weight="800" text-anchor="start">UTILITY</text>
+            <text x="${(cx + R + 14).toFixed(1)}" y="${cy + 65}" fill="#ffaa33" font-size="10" font-weight="800" text-anchor="start">${perf.utility || 40.4}</text>
+
+            <text x="${(cx - R - 14).toFixed(1)}" y="${cy + 52}" fill="#ffffff" font-size="11" font-weight="800" text-anchor="end">POSITIONING</text>
+            <text x="${(cx - R - 14).toFixed(1)}" y="${cy + 65}" fill="#ffaa33" font-size="10" font-weight="800" text-anchor="end">${perf.positioning || 65.9}</text>
+        </svg>
+    `;
+}
+
+// Activity Bar Chart SVG (Win/Loss/Tie Distribution)
+function generateActivityBarsSVG() {
+    const barsData = [
+        { w: 14, l: 2, t: 0, label: "W1" },
+        { w: 18, l: 3, t: 0, label: "W2" },
+        { w: 16, l: 2, t: 1, label: "W3" },
+        { w: 22, l: 4, t: 0, label: "W4" },
+        { w: 19, l: 3, t: 0, label: "W5" },
+        { w: 25, l: 5, t: 0, label: "W6" },
+        { w: 23, l: 6, t: 0, label: "W7" }
+    ];
+
+    const chartW = 320;
+    const chartH = 110;
+    const barWidth = 28;
+    const gap = 16;
+    const startX = 14;
+
+    const barsHTML = barsData.map((d, i) => {
+        const x = startX + i * (barWidth + gap);
+        const total = d.w + d.l + d.t;
+        const maxScale = 30;
+        const hWin = (d.w / maxScale) * 80;
+        const hLoss = (d.l / maxScale) * 80;
+        const yLoss = chartH - 22 - hLoss;
+        const yWin = yLoss - hWin;
+
+        return `
+            <rect x="${x}" y="${yWin}" width="${barWidth}" height="${hWin}" fill="#00a2ed" rx="3" />
+            <rect x="${x}" y="${yLoss}" width="${barWidth}" height="${hLoss}" fill="rgba(255,255,255,0.22)" rx="2" />
+            <text x="${x + barWidth / 2}" y="${chartH - 8}" fill="rgba(255,255,255,0.5)" font-size="9" text-anchor="middle">${d.label}</text>
+        `;
+    }).join("");
+
+    return `
+        <svg width="100%" height="110" viewBox="0 0 ${chartW} ${chartH}" preserveAspectRatio="none">
+            <line x1="0" y1="${chartH - 22}" x2="${chartW}" y2="${chartH - 22}" stroke="rgba(255,255,255,0.08)" stroke-width="1" />
+            ${barsHTML}
+        </svg>
+    `;
+}
+
+// Premier Rating Climb SVG
+function generateRankClimbSVG() {
+    const pts = [
+        { x: 15, y: 78, val: "7.5k" },
+        { x: 70, y: 64, val: "10.2k" },
+        { x: 130, y: 46, val: "12.8k" },
+        { x: 190, y: 32, val: "14.4k" },
+        { x: 250, y: 16, val: "15.1k" },
+        { x: 305, y: 18, val: "15,003" }
+    ];
+
+    const pathD = `M ${pts[0].x} ${pts[0].y} Q 40 70, ${pts[1].x} ${pts[1].y} T ${pts[2].x} ${pts[2].y} T ${pts[3].x} ${pts[3].y} T ${pts[4].x} ${pts[4].y} T ${pts[5].x} ${pts[5].y}`;
+    const areaD = `${pathD} L 305 100 L 15 100 Z`;
+
+    const dots = pts.map((p, i) => `
+        <circle cx="${p.x}" cy="${p.y}" r="${i === pts.length - 1 ? 4.5 : 3}" fill="${i === pts.length - 1 ? '#ffaa33' : '#c084fc'}" stroke="#ffffff" stroke-width="1.5" />
+        <text x="${p.x}" y="${p.y - 7}" fill="#ffffff" font-size="8.5" font-weight="700" text-anchor="middle">${p.val}</text>
+    `).join("");
+
+    return `
+        <svg width="100%" height="110" viewBox="0 0 320 110" preserveAspectRatio="none">
+            <defs>
+                <linearGradient id="rankGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stop-color="#c084fc" stop-opacity="0.35"/>
+                    <stop offset="100%" stop-color="#c084fc" stop-opacity="0"/>
+                </linearGradient>
+            </defs>
+            <path d="${areaD}" fill="url(#rankGrad)" />
+            <path d="${pathD}" fill="none" stroke="#c084fc" stroke-width="2.5" stroke-linecap="round" />
+            ${dots}
+        </svg>
+    `;
+}
+
+
 // --- ADMIN EDIT MODE ---
 export function openAdminEditMode() {
     isOwner = true;
@@ -2373,6 +4127,7 @@ export function openAdminEditMode() {
                 <button class="owner-tab-btn active" data-tab="tab-wallpaper">🖼️ Wallpaper</button>
                 <button class="owner-tab-btn" data-tab="tab-desktop">🖥️ Desktop Layout</button>
                 <button class="owner-tab-btn" data-tab="tab-music">🎵 Music Library</button>
+                <button class="owner-tab-btn" data-tab="tab-cs2">🎯 CS2 & Leetify</button>
             </div>
 
             <!-- Tab 1: Wallpaper -->
@@ -2448,7 +4203,7 @@ export function openAdminEditMode() {
                         <button class="owner-save-btn" id="owner-ml-save" style="height: 30px; font-size: 11.5px; padding: 0 12px;">Save Music Library</button>
                     </div>
                 </div>
-                <div class="owner-subtext">Add or remove songs playable in the HDD mini-player. Saved to Firebase Firestore.</div>
+                <div class="owner-subtext">Add or remove songs playable in the HDD mini-player (Supports MP3, YouTube, Spotify, SoundCloud, Google Drive). Saved to Firebase.</div>
 
                 <div class="owner-list" id="owner-ml-list"></div>
 
@@ -2465,8 +4220,8 @@ export function openAdminEditMode() {
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
                     <div class="owner-field">
-                        <label class="owner-label">Audio URL / Path</label>
-                        <input type="text" id="new-song-src" class="owner-input" placeholder="files/music/song1.mp3 or web mp3" />
+                        <label class="owner-label">Audio URL / Link (YouTube, Spotify, SoundCloud, Drive, MP3)</label>
+                        <input type="text" id="new-song-src" class="owner-input" placeholder="https://... or files/music/song1.mp3" />
                     </div>
                     <div class="owner-field">
                         <label class="owner-label">Cover Image URL</label>
@@ -2474,6 +4229,50 @@ export function openAdminEditMode() {
                     </div>
                 </div>
                 <button class="owner-save-btn" id="new-song-add" style="background: #444; height: 36px;">+ Add Track to Library</button>
+            </div>
+
+            <!-- Tab 4: CS2 & Leetify Settings -->
+            <div class="owner-tab-content" id="tab-cs2">
+                <div class="owner-section-title">
+                    <span>Counter-Strike 2 & Leetify Settings</span>
+                    <button class="owner-save-btn" id="owner-cs2-save" style="height: 30px; font-size: 11.5px; padding: 0 12px;">Save CS2 Config</button>
+                </div>
+                <div class="owner-subtext">Stats are retrieved automatically via your Leetify API key. No manual stats data entry required.</div>
+
+                <div class="owner-field">
+                    <label class="owner-label">Cover Video URL (Direct MP4, YouTube, Google Drive, or Web Video)</label>
+                    <input type="text" id="owner-cs2-video-url" class="owner-input" value="${escapeHTML(currentCs2Config.videoUrl || '')}" placeholder="https://.../video.mp4 or YouTube link" />
+                </div>
+
+                <div class="owner-field">
+                    <label class="owner-label">Cover Video Title</label>
+                    <input type="text" id="owner-cs2-video-title" class="owner-input" value="${escapeHTML(currentCs2Config.videoTitle || 'CS2 Cinematic Cover Video')}" placeholder="e.g. CS2 Cinematic Cover Video" />
+                </div>
+
+                <div class="owner-field">
+                    <label class="owner-label">Leetify Developer API Key</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="owner-cs2-api-key" class="owner-input" value="${escapeHTML(currentCs2Config.leetifyApiKey || 'cc554ec3-3db6-4f54-83b2-c070c40da483')}" placeholder="cc554ec3-3db6-4f54-83b2-c070c40da483" style="font-family: monospace; letter-spacing: 0.5px;" />
+                        <button type="button" class="owner-btn-mini" id="owner-cs2-sync-btn" style="width: auto; padding: 0 14px; background: rgba(255, 119, 0, 0.2); border: 1px solid #ff7700; color: #ff9933; font-weight: 700; white-space: nowrap;">⚡ Sync API</button>
+                    </div>
+                </div>
+
+                <div class="owner-field">
+                    <label class="owner-label">Leetify Profile URL</label>
+                    <input type="text" id="owner-cs2-leetify-url" class="owner-input" value="${escapeHTML(currentCs2Config.leetifyUrl || 'https://leetify.com/app/profile/76561199580350164')}" placeholder="https://leetify.com/app/profile/76561199580350164" />
+                </div>
+
+                <div style="background: rgba(255, 119, 0, 0.08); border: 1px solid rgba(255, 119, 0, 0.25); border-radius: 8px; padding: 12px 14px; margin-top: 12px; font-size: 12px; color: rgba(255, 255, 255, 0.85); display: flex; align-items: center; gap: 10px;">
+                    <iconify-icon icon="fluent:checkmark-circle-24-filled" style="color: #2ed573; font-size: 20px; flex-shrink: 0;"></iconify-icon>
+                    <div>
+                        <strong>Automatic Leetify Sync Active:</strong> All stats, Premier rating (${Number(currentCs2Config.premierRating || 15003).toLocaleString()}), Skill rating (${currentCs2Config.skillRating || '60.17'}), Headshot %, Radar, and Match breakdowns are linked to your Leetify API.
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 8px; margin-top: 14px;">
+                    <button class="owner-save-btn" id="owner-cs2-save-bottom" style="flex: 1;">Save CS2 Config</button>
+                    <button type="button" class="owner-btn-mini" id="owner-cs2-test-btn" style="width: auto; padding: 0 16px; height: 40px; background: rgba(255, 119, 0, 0.25); border: 1px solid #ff7700; color: #ffffff;" title="Test cover video now">▶ Test Cover Video</button>
+                </div>
             </div>
 
             <!-- Status Footer -->
@@ -2864,25 +4663,20 @@ export function openAdminEditMode() {
     if (srcInputEl) {
         srcInputEl.addEventListener("input", async () => {
             const val = srcInputEl.value.trim();
-            const ytId = extractYouTubeId(val);
-            if (ytId) {
+            if (!val) return;
+            const meta = await fetchUniversalMediaMetadata(val);
+            if (meta) {
                 const titleInput = win.querySelector("#new-song-title");
                 const artistInput = win.querySelector("#new-song-artist");
                 const coverInput = win.querySelector("#new-song-cover");
-                if (coverInput && !coverInput.value) {
-                    coverInput.value = getYouTubeThumbnail(ytId);
+                if (titleInput && (!titleInput.value || titleInput.value.includes("http") || titleInput.value.includes("youtu"))) {
+                    titleInput.value = meta.cleanTitle || meta.title || "";
                 }
-                const meta = await fetchYouTubeMetadata(ytId);
-                if (meta) {
-                    if (titleInput && (!titleInput.value || titleInput.value.includes("youtu"))) {
-                        titleInput.value = meta.cleanTitle || meta.title;
-                    }
-                    if (artistInput && (!artistInput.value || artistInput.value === "Unknown Artist")) {
-                        artistInput.value = meta.artist || "YouTube";
-                    }
-                    if (coverInput) {
-                        coverInput.value = meta.thumbnail || getYouTubeThumbnail(ytId);
-                    }
+                if (artistInput && (!artistInput.value || artistInput.value === "Unknown Artist" || artistInput.value === "YouTube")) {
+                    artistInput.value = meta.artist || "";
+                }
+                if (coverInput && (!coverInput.value || coverInput.value.includes("song1.jpg"))) {
+                    coverInput.value = meta.thumbnail || "";
                 }
             }
         });
@@ -2898,9 +4692,12 @@ export function openAdminEditMode() {
             const rawSrc = srcInput.value.trim() || "files/music/song1.mp3";
             const ytId = extractYouTubeId(rawSrc);
             const isYT = !!ytId;
+            const isSp = isSpotifyTrack({ src: rawSrc });
+            const isSc = isSoundCloudTrack({ src: rawSrc });
+            const isGd = isGoogleDriveTrack({ src: rawSrc });
             const src = isYT ? `https://www.youtube.com/watch?v=${ytId}` : rawSrc;
-            const title = titleInput.value.trim() || (isYT ? `YouTube Track (${ytId})` : "Custom Track");
-            const artist = artistInput.value.trim() || (isYT ? "YouTube" : "Unknown Artist");
+            const title = titleInput.value.trim() || (isYT ? `YouTube Track (${ytId})` : isSp ? "Spotify Track" : isSc ? "SoundCloud Track" : "Custom Track");
+            const artist = artistInput.value.trim() || (isYT ? "YouTube" : isSp ? "Spotify" : isSc ? "SoundCloud" : isGd ? "Google Drive" : "Unknown Artist");
             const cover = coverInput.value.trim() || (isYT ? getYouTubeThumbnail(ytId) : "files/cover/song1.jpg");
 
             if (!title) return;
@@ -2910,7 +4707,10 @@ export function openAdminEditMode() {
                 artist,
                 src,
                 cover,
-                ...(isYT ? { isYouTube: true, youtubeId: ytId } : {})
+                ...(isYT ? { isYouTube: true, youtubeId: ytId } : {}),
+                ...(isSp ? { isSpotify: true } : {}),
+                ...(isSc ? { isSoundCloud: true } : {}),
+                ...(isGd ? { isGoogleDrive: true } : {})
             };
             currentMusicLibrary.push(newSong);
 
@@ -2924,7 +4724,10 @@ export function openAdminEditMode() {
                     artist,
                     src,
                     customIcon: cover,
-                    ...(isYT ? { isYouTube: true, youtubeId: ytId } : {})
+                    ...(isYT ? { isYouTube: true, youtubeId: ytId } : {}),
+                    ...(isSp ? { isSpotify: true } : {}),
+                    ...(isSc ? { isSoundCloud: true } : {}),
+                    ...(isGd ? { isGoogleDrive: true } : {})
                 });
                 await saveDesktopData(currentDesktopData);
                 const fWinId = `win-${musicFolder.name.toLowerCase().replace(/\s+/g, '-')}`;
@@ -2961,6 +4764,52 @@ export function openAdminEditMode() {
             mlSaveBtn.textContent = "Save Music Library";
             mlSaveBtn.disabled = false;
             showToast(res.firestore ? "Music library saved to Firebase Firestore!" : "Music library saved to localStorage!");
+        });
+    }
+
+    // --- CS2 & Leetify Settings Event Listeners ---
+    const cs2VideoUrlInput = win.querySelector("#owner-cs2-video-url");
+    const cs2VideoTitleInput = win.querySelector("#owner-cs2-video-title");
+    const cs2ApiKeyInput = win.querySelector("#owner-cs2-api-key");
+    const cs2LeetifyUrlInput = win.querySelector("#owner-cs2-leetify-url");
+    const cs2SyncBtn = win.querySelector("#owner-cs2-sync-btn");
+    const cs2SaveBtn = win.querySelector("#owner-cs2-save");
+    const cs2SaveBtnBottom = win.querySelector("#owner-cs2-save-bottom");
+    const cs2TestBtn = win.querySelector("#owner-cs2-test-btn");
+
+    const handleCs2Save = async (showToastMsg = true) => {
+        const updatedConfig = {
+            ...currentCs2Config,
+            videoUrl: (cs2VideoUrlInput && cs2VideoUrlInput.value.trim()) || "",
+            videoTitle: (cs2VideoTitleInput && cs2VideoTitleInput.value.trim()) || "CS2 Cinematic Cover Video",
+            leetifyApiKey: (cs2ApiKeyInput && cs2ApiKeyInput.value.trim()) || "cc554ec3-3db6-4f54-83b2-c070c40da483",
+            leetifyUrl: (cs2LeetifyUrlInput && cs2LeetifyUrlInput.value.trim()) || "https://leetify.com/app/profile/76561199580350164"
+        };
+
+        saveCs2Config(updatedConfig);
+        if (showToastMsg) {
+            showToast("CS2 Cover & Leetify settings saved successfully!");
+        }
+    };
+
+    if (cs2SyncBtn) {
+        cs2SyncBtn.addEventListener("click", async () => {
+            const key = (cs2ApiKeyInput && cs2ApiKeyInput.value.trim()) || "cc554ec3-3db6-4f54-83b2-c070c40da483";
+            cs2SyncBtn.disabled = true;
+            cs2SyncBtn.textContent = "Syncing...";
+            await syncLeetifyStats(key);
+            cs2SyncBtn.disabled = false;
+            cs2SyncBtn.textContent = "⚡ Sync API";
+            showToast("Leetify API synced successfully!");
+        });
+    }
+
+    if (cs2SaveBtn) cs2SaveBtn.addEventListener("click", () => handleCs2Save(true));
+    if (cs2SaveBtnBottom) cs2SaveBtnBottom.addEventListener("click", () => handleCs2Save(true));
+    if (cs2TestBtn) {
+        cs2TestBtn.addEventListener("click", () => {
+            handleCs2Save(false);
+            openCs2Experience();
         });
     }
 }
@@ -3027,7 +4876,6 @@ function initHDDPlayer() {
                 <button class="hdd-btn" id="hdd-prev-btn" title="Previous">⏮</button>
                 <button class="hdd-btn" id="hdd-play-btn" title="Play">▶</button>
                 <button class="hdd-btn" id="hdd-next-btn" title="Next">⏭</button>
-                <button class="hdd-btn" id="hdd-video-btn" title="Toggle YouTube Video Window" style="display: none;">📺</button>
             </div>
         `;
 
@@ -3071,12 +4919,10 @@ function initHDDPlayer() {
         const playBtn = document.getElementById("hdd-play-btn");
         const prevBtn = document.getElementById("hdd-prev-btn");
         const nextBtn = document.getElementById("hdd-next-btn");
-        const videoBtn = document.getElementById("hdd-video-btn");
 
         if (playBtn) playBtn.addEventListener("click", togglePlay);
         if (prevBtn) prevBtn.addEventListener("click", prevTrack);
         if (nextBtn) nextBtn.addEventListener("click", nextTrack);
-        if (videoBtn) videoBtn.addEventListener("click", toggleYouTubeVideoWindow);
 
         audio.addEventListener("ended", nextTrack);
         audio.addEventListener("error", (err) => {
@@ -3094,14 +4940,12 @@ function updateHDDUI() {
     const title = document.getElementById("hdd-track-name");
     const playBtn = document.getElementById("hdd-play-btn");
     const playerDiv = document.getElementById("hdd-mini-player");
-    const videoBtn = document.getElementById("hdd-video-btn");
 
     if (!Array.isArray(currentMusicLibrary) || currentMusicLibrary.length === 0) {
         if (cover) cover.src = "files/cover/song1.jpg";
         if (title) title.textContent = "No tracks in library";
         if (playBtn) playBtn.textContent = "▶";
         if (playerDiv) playerDiv.classList.remove("playing");
-        if (videoBtn) videoBtn.style.display = "none";
         return;
     }
 
@@ -3118,16 +4962,13 @@ function updateHDDUI() {
         if (isPlaying) playerDiv.classList.add("playing");
         else playerDiv.classList.remove("playing");
     }
+}
 
-    if (videoBtn) {
-        if (isYouTubeTrack(track)) {
-            videoBtn.style.display = "inline-flex";
-            videoBtn.title = "View / Hide YouTube Video";
-            if (isPlaying) videoBtn.classList.add("active-video");
-            else videoBtn.classList.remove("active-video");
-        } else {
-            videoBtn.style.display = "none";
-        }
+export function stopExternalEmbeds() {
+    const bridge = document.getElementById("bg-media-bridge");
+    if (bridge) {
+        const embeds = bridge.querySelectorAll(".bg-embed-frame");
+        embeds.forEach(el => el.remove());
     }
 }
 
@@ -3142,8 +4983,11 @@ export async function playCurrentTrack() {
     const track = currentMusicLibrary[currentTrackIndex];
     if (!track) return;
 
+    // Halt previous streams
+    stopExternalEmbeds();
+
     if (isYouTubeTrack(track)) {
-        // Stop audio element
+        // Audio-only YouTube playback via headless bridge
         audio.pause();
         audio.src = "";
 
@@ -3153,11 +4997,53 @@ export async function playCurrentTrack() {
         } else {
             showToast("Invalid YouTube track source", false);
         }
-    } else {
-        // Pause YouTube video if playing
+    } else if (isSpotifyTrack(track)) {
+        audio.pause();
+        audio.src = "";
         pauseYouTubeVideo();
 
-        const actualSrc = await loadTrackSource(track);
+        const trackId = extractSpotifyTrackId(track.src);
+        if (trackId) {
+            let bridge = document.getElementById("bg-media-bridge");
+            if (!bridge) {
+                bridge = document.createElement("div");
+                bridge.id = "bg-media-bridge";
+                bridge.className = "bg-media-bridge";
+                document.body.appendChild(bridge);
+            }
+            const iframe = document.createElement("iframe");
+            iframe.className = "bg-embed-frame";
+            iframe.src = `https://open.spotify.com/embed/track/${trackId}?utm_source=generator&theme=0&autoplay=1`;
+            iframe.allow = "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture";
+            bridge.appendChild(iframe);
+            isPlaying = true;
+        }
+    } else if (isSoundCloudTrack(track)) {
+        audio.pause();
+        audio.src = "";
+        pauseYouTubeVideo();
+
+        let bridge = document.getElementById("bg-media-bridge");
+        if (!bridge) {
+            bridge = document.createElement("div");
+            bridge.id = "bg-media-bridge";
+            bridge.className = "bg-media-bridge";
+            document.body.appendChild(bridge);
+        }
+        const iframe = document.createElement("iframe");
+        iframe.className = "bg-embed-frame";
+        iframe.src = `https://w.soundcloud.com/player/?url=${encodeURIComponent(track.src)}&auto_play=true&hide_related=true&show_comments=false&show_user=false&show_reposts=false&show_teaser=false`;
+        iframe.allow = "autoplay";
+        bridge.appendChild(iframe);
+        isPlaying = true;
+    } else {
+        // Direct Audio & Google Drive streaming
+        pauseYouTubeVideo();
+
+        let actualSrc = await loadTrackSource(track);
+        if (isGoogleDriveTrack(track) || isGoogleDriveTrack({ src: actualSrc })) {
+            actualSrc = convertGoogleDriveAudioUrl(actualSrc);
+        }
         if (!audio.src || !audio.src.includes(actualSrc)) {
             audio.src = actualSrc;
         }
@@ -3173,6 +5059,7 @@ export function pauseCurrentPlayback() {
     isPlaying = false;
     audio.pause();
     pauseYouTubeVideo();
+    stopExternalEmbeds();
     updateHDDUI();
 }
 
@@ -3199,6 +5086,8 @@ async function togglePlay() {
             } else {
                 await playCurrentTrack();
             }
+        } else if (isSpotifyTrack(track) || isSoundCloudTrack(track)) {
+            await playCurrentTrack();
         } else {
             const actualSrc = await loadTrackSource(track);
             if (!audio.src || !audio.src.includes(actualSrc)) {
@@ -5129,7 +7018,7 @@ function setupMusicUploadModal() {
             await playCurrentTrack();
 
             if (isYouTube) {
-                showToast(`Now playing "${title}" in background 🎵 (click 📺 on HDD to watch)`);
+                showToast(`Now playing "${title}" in background 🎵`);
             } else if (currentMusicSourceMode === "link") {
                 showToast(`Now streaming "${title}" in background 🎵`);
             } else {
@@ -5309,6 +7198,13 @@ function bootOS() {
         console.error("Failed opening default Guestbook window:", e);
     }
 
+    // 10b. Setup Desktop Drop Zone for Admin icon repositioning
+    try {
+        setupDesktopDropZone();
+    } catch (e) {
+        console.error("Failed initializing Desktop Drop Zone:", e);
+    }
+
     // 11. Check & synchronize with remote Firebase Firestore config
     try {
         loadRemoteConfig().then(config => {
@@ -5319,9 +7215,16 @@ function bootOS() {
                 currentDesktopData = sanitizeDesktopData(config.desktopData);
                 renderDesktop();
             }
+            if (config.desktopPositions && typeof config.desktopPositions === 'object') {
+                currentDesktopPositions = { ...currentDesktopPositions, ...config.desktopPositions };
+                renderDesktop();
+            }
             if (config.musicLibrary && Array.isArray(config.musicLibrary)) {
                 setMusicLibrary(config.musicLibrary);
                 updateHDDUI();
+            }
+            if (config.cs2Config && typeof config.cs2Config === 'object') {
+                currentCs2Config = { ...DEFAULT_CS2_CONFIG, ...config.cs2Config };
             }
         }).catch(err => {
             console.warn("Firebase remote config load warning:", err);
@@ -5334,13 +7237,29 @@ function bootOS() {
             } else if (key === 'desktopData' && Array.isArray(value)) {
                 currentDesktopData = sanitizeDesktopData(value);
                 renderDesktop();
+            } else if (key === 'desktopPositions' && typeof value === 'object') {
+                currentDesktopPositions = { ...currentDesktopPositions, ...value };
+                renderDesktop();
             } else if (key === 'musicLibrary' && Array.isArray(value)) {
                 setMusicLibrary(value);
                 updateHDDUI();
+            } else if (key === 'cs2Config' && typeof value === 'object') {
+                currentCs2Config = { ...DEFAULT_CS2_CONFIG, ...value };
             }
         });
     } catch (e) {
         console.warn("Firebase config subscription warning:", e);
+    }
+
+    // 12. Auto-sync Leetify API telemetry on site load
+    try {
+        syncLeetifyStats().then(() => {
+            console.log("Leetify API auto-sync completed on site boot.");
+        }).catch(err => {
+            console.warn("Auto-sync Leetify API on boot warning:", err);
+        });
+    } catch (e) {
+        console.warn("Auto-sync Leetify trigger error:", e);
     }
 }
 

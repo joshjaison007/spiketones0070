@@ -42,6 +42,7 @@ export const desktopData = [
         type: "cs2", 
         content: []
     },
+    { name: "Mail", type: "mail" },
     { name: "text.txt", type: "file" },
     { name: "Snake", type: "snake" },
     { name: "Terminal", type: "terminal" },

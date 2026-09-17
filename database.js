@@ -10,11 +10,12 @@ import {
     getDocs, 
     onSnapshot, 
     setDoc, 
-    getDoc,
+    getDoc, 
     doc, 
     query, 
     orderBy,
     deleteDoc,
+    limit,
     isFirebaseConfigured,
     isFirebaseStorageConfigured
 } from './firebase.js';
@@ -262,6 +263,10 @@ export async function loadRemoteConfig() {
             if (csSnap.exists() && csSnap.data()) {
                 config.cs2Config = csSnap.data();
             }
+            const posSnap = await getDoc(doc(db, 'config', 'desktop_positions'));
+            if (posSnap.exists() && posSnap.data()) {
+                config.desktopPositions = posSnap.data().value || posSnap.data();
+            }
             if (Object.keys(config).length > 0) {
                 return config;
             }
@@ -310,12 +315,20 @@ export function subscribeRemoteConfig(onConfigChange) {
             }, (err) => {
                 console.warn("CS2 config snapshot listener inactive:", err?.message || err);
             });
+            const unsubPos = onSnapshot(doc(db, 'config', 'desktop_positions'), (snap) => {
+                if (snap.exists() && snap.data()) {
+                    onConfigChange('desktopPositions', snap.data().value || snap.data());
+                }
+            }, (err) => {
+                console.warn("Desktop positions snapshot listener inactive:", err?.message || err);
+            });
             return () => {
                 if (unsubWp) unsubWp();
                 if (unsubDt) unsubDt();
                 if (unsubMl) unsubMl();
                 if (unsubPw) unsubPw();
                 if (unsubCs) unsubCs();
+                if (unsubPos) unsubPos();
             };
         } catch (e) {
             console.warn("Remote config subscription warning:", e);
@@ -580,10 +593,138 @@ export function loadLocalOverrides() {
                 result.cs2Config = parsed;
             }
         }
+        const pos = localStorage.getItem('st_desktop_positions');
+        if (pos) {
+            const parsed = JSON.parse(pos);
+            if (parsed && typeof parsed === 'object') {
+                result.desktopPositions = parsed;
+            }
+        }
     } catch(e) {
         console.warn("Failed parsing local overrides cache:", e);
     }
     return result;
+}
+
+// Save Desktop Positions (Admin moves icons, saved to Firestore so all guests and sessions see them)
+export async function saveDesktopPositions(positions) {
+    let savedToFirestore = false;
+    if (isFirebaseConfigured() && db) {
+        try {
+            await setDoc(doc(db, 'config', 'desktop_positions'), { value: positions }, { merge: true });
+            savedToFirestore = true;
+            recordDbUpdate();
+        } catch (err) {
+            console.warn("Firebase saveDesktopPositions error (saving locally):", err);
+        }
+    }
+    try {
+        localStorage.setItem('st_desktop_positions', JSON.stringify(positions));
+    } catch (e) {}
+    return { success: true, firestore: savedToFirestore };
+}
+
+// --- Gmail-Style Mail App Database Handlers ---
+export async function sendMailMessage({ to = 'joshjaison2020@gmail.com', senderId, subject, message }) {
+    const cleanSender = (senderId || 'Guest').trim();
+    const cleanSubject = (subject || '(No Subject)').trim();
+    const cleanMessage = (message || '').trim();
+
+    const msgData = {
+        to: to || 'joshjaison2020@gmail.com',
+        senderId: cleanSender,
+        subject: cleanSubject,
+        message: cleanMessage,
+        created_at: new Date().toISOString(),
+        read: false
+    };
+
+    let docId = 'local-' + Date.now();
+    let savedToFirestore = false;
+
+    if (isFirebaseConfigured() && db) {
+        try {
+            const docRef = await addDoc(collection(db, 'mail_messages'), msgData);
+            docId = docRef.id;
+            savedToFirestore = true;
+            recordDbUpdate();
+        } catch (err) {
+            console.warn("Firebase sendMailMessage error (saving locally):", err);
+        }
+    }
+
+    // Always cache locally so sender or local user has an immediate record
+    try {
+        const raw = localStorage.getItem('st_mail_messages') || '[]';
+        const list = JSON.parse(raw);
+        list.unshift({ id: docId, ...msgData });
+        localStorage.setItem('st_mail_messages', JSON.stringify(list.slice(0, 100)));
+    } catch (e) {}
+
+    return { success: true, id: docId, savedToFirestore, ...msgData };
+}
+
+export async function fetchMailMessages() {
+    if (isFirebaseConfigured() && db) {
+        try {
+            const q = query(collection(db, 'mail_messages'), orderBy('created_at', 'desc'), limit(50));
+            const snap = await getDocs(q);
+            const messages = [];
+            snap.forEach(d => {
+                messages.push({ id: d.id, ...d.data() });
+            });
+            if (messages.length > 0) {
+                try {
+                    localStorage.setItem('st_mail_messages', JSON.stringify(messages));
+                } catch(e) {}
+                return messages;
+            }
+        } catch (err) {
+            console.warn("Firebase fetchMailMessages error:", err);
+        }
+    }
+    try {
+        const raw = localStorage.getItem('st_mail_messages') || '[]';
+        return JSON.parse(raw);
+    } catch (e) {
+        return [];
+    }
+}
+
+export async function deleteMailMessage(id) {
+    if (isFirebaseConfigured() && db && !id.startsWith('local-')) {
+        try {
+            await deleteDoc(doc(db, 'mail_messages', id));
+            recordDbUpdate();
+        } catch (err) {
+            console.warn("Firebase deleteMailMessage error:", err);
+        }
+    }
+    try {
+        const raw = localStorage.getItem('st_mail_messages') || '[]';
+        const list = JSON.parse(raw).filter(m => m.id !== id);
+        localStorage.setItem('st_mail_messages', JSON.stringify(list));
+    } catch (e) {}
+}
+
+export function subscribeMailMessages(onMessagesChange) {
+    if (isFirebaseConfigured() && db) {
+        try {
+            const q = query(collection(db, 'mail_messages'), orderBy('created_at', 'desc'), limit(50));
+            return onSnapshot(q, (snap) => {
+                const messages = [];
+                snap.forEach(d => {
+                    messages.push({ id: d.id, ...d.data() });
+                });
+                onMessagesChange(messages);
+            }, (err) => {
+                console.warn("Mail messages snapshot error:", err);
+            });
+        } catch (e) {
+            console.warn("subscribeMailMessages error:", e);
+        }
+    }
+    return () => {};
 }
 
 export function clearCorruptedLocalCache() {
@@ -591,6 +732,7 @@ export function clearCorruptedLocalCache() {
         localStorage.removeItem('st_desktop_data');
         localStorage.removeItem('st_music_library');
         localStorage.removeItem('st_pinned_windows');
+        localStorage.removeItem('st_desktop_positions');
         console.log("OS local storage cache reset successfully.");
     } catch(e) {}
 }

@@ -1,6 +1,6 @@
 {
   "name": "SPIKETONES007 OS",
-  "description": "Retro-modern desktop web OS with Firebase guestbook, HDD music player, file system, widgets, and customization.",
+  "description": "Retro-modern desktop web OS with CS2 fullscreen player, Leetify stats, background music player, Firebase guestbook, and widgets.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

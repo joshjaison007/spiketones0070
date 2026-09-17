@@ -12,7 +12,8 @@ import {
     doc, 
     query, 
     orderBy, 
-    deleteDoc 
+    deleteDoc,
+    limit
 } from "firebase/firestore";
 import { 
     getStorage, 
@@ -86,5 +87,6 @@ export {
     doc, 
     query, 
     orderBy, 
-    deleteDoc 
+    deleteDoc,
+    limit 
 };
