@@ -9,6 +9,7 @@ export const desktopData = [
         name: "Socials", 
         type: "folder", 
         content: [
+            { name: "Mail", type: "mail" },
             { name: "YouTube", type: "link", url: "https://www.youtube.com/@SPIKETONES007", customIcon: "logos:youtube-icon" },
             { name: "Instagram", type: "link", url: "https://www.instagram.com/josh.jaison/", customIcon: "files/instagram.png" },
             { name: "Discord", type: "link", url: "https://discord.com/users/738312534502932541", customIcon: "logos:discord-icon" },
@@ -42,7 +43,6 @@ export const desktopData = [
         type: "cs2", 
         content: []
     },
-    { name: "Mail", type: "mail" },
     { name: "text.txt", type: "file" },
     { name: "Snake", type: "snake" },
     { name: "Terminal", type: "terminal" },

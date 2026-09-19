@@ -606,6 +606,62 @@ export function loadLocalOverrides() {
     return result;
 }
 
+// Save a local override to localStorage
+export function saveLocalOverride(key, value) {
+    try {
+        const storageKeys = {
+            desktopData: 'st_desktop_data',
+            wallpaper: 'st_wallpaper',
+            musicLibrary: 'st_music_library',
+            pinnedWindows: 'st_pinned_windows',
+            cs2Config: 'st_cs2_config',
+            desktopPositions: 'st_desktop_positions'
+        };
+        const storageKey = storageKeys[key] || `st_${key}`;
+        if (typeof value === 'string') {
+            localStorage.setItem(storageKey, value);
+        } else {
+            localStorage.setItem(storageKey, JSON.stringify(value));
+        }
+    } catch (e) {
+        console.warn("Failed saving local override:", e);
+    }
+}
+
+// Save config to remote Firestore (and localStorage via specific functions)
+export async function saveRemoteConfig(key, value) {
+    if (key === 'cs2Config') {
+        return saveCs2Config(value);
+    } else if (key === 'wallpaper') {
+        return saveWallpaper(value);
+    } else if (key === 'desktopData') {
+        return saveDesktopData(value);
+    } else if (key === 'musicLibrary') {
+        return saveMusicLibrary(value);
+    } else if (key === 'pinnedWindows') {
+        return savePinnedWindows(value);
+    } else if (key === 'desktopPositions') {
+        return saveDesktopPositions(value);
+    }
+    
+    // Generic fallback for any other config key
+    let savedToFirestore = false;
+    if (isFirebaseConfigured() && db) {
+        try {
+            await setDoc(doc(db, 'config', key), {
+                value: value,
+                updated_at: new Date().toISOString()
+            }, { merge: true });
+            savedToFirestore = true;
+            recordDbUpdate();
+        } catch (err) {
+            console.warn(`Firebase saveRemoteConfig error for ${key}:`, err);
+        }
+    }
+    saveLocalOverride(key, value);
+    return { success: true, firestore: savedToFirestore };
+}
+
 // Save Desktop Positions (Admin moves icons, saved to Firestore so all guests and sessions see them)
 export async function saveDesktopPositions(positions) {
     let savedToFirestore = false;

@@ -8,6 +8,9 @@ import {
     saveWallpaper, 
     saveMusicLibrary, 
     savePinnedWindows,
+    saveCs2Config as saveCs2ConfigToDb,
+    saveLocalOverride,
+    saveRemoteConfig,
     loadRemoteConfig,
     subscribeRemoteConfig,
     loadLocalOverrides,
@@ -85,7 +88,11 @@ export function isYouTubeTrack(track) {
 // Google Drive Audio & Video Helpers
 export function extractGoogleDriveId(url) {
     if (!url || typeof url !== 'string') return null;
-    const match = url.match(/(?:\/file\/d\/|\/d\/|id=|open\?id=|\/folders\/)([a-zA-Z0-9_-]{15,})/);
+    const trimmed = url.trim();
+    if (/^[a-zA-Z0-9_-]{20,}$/.test(trimmed)) {
+        return trimmed;
+    }
+    const match = trimmed.match(/(?:\/file\/d\/|\/d\/|id=|open\?id=|\/folders\/)([a-zA-Z0-9_-]{15,})/);
     return match ? match[1] : null;
 }
 
@@ -100,7 +107,13 @@ export function convertGoogleDriveAudioUrl(url) {
 export function isGoogleDriveTrack(track) {
     if (!track) return false;
     const src = track.src || track.url || (typeof track === "string" ? track : "");
-    return track.isGoogleDrive || (typeof src === "string" && (src.includes("drive.google.com") || src.includes("docs.google.com")));
+    if (typeof src !== "string") return false;
+    const trimmed = src.trim();
+    return track.isGoogleDrive || 
+           trimmed.includes("drive.google.com") || 
+           trimmed.includes("docs.google.com") ||
+           trimmed.includes("drive.usercontent.google.com") ||
+           /^[a-zA-Z0-9_-]{20,}$/.test(trimmed);
 }
 
 // Spotify Audio Helpers
@@ -463,7 +476,7 @@ audio.crossOrigin = "anonymous";
 
 // Default CS2 & Leetify Configuration
 export const DEFAULT_CS2_CONFIG = {
-    videoUrl: "https://assets.mixkit.co/videos/preview/mixkit-military-soldier-aiming-in-the-dark-42407-large.mp4",
+    videoUrl: "/cs2-cinematic.mp4",
     videoTitle: "CS2 Cinematic Cover Video",
     leetifyApiKey: "cc554ec3-3db6-4f54-83b2-c070c40da483",
     leetifyUrl: "https://leetify.com/app/profile/76561199580350164",
@@ -612,8 +625,7 @@ export const DEFAULT_DESKTOP_ICON_POSITIONS = {
     "Links": { x: 20, y: 110 },
     "Music": { x: 20, y: 200 },
     "CS2": { x: 20, y: 290 },
-    "Mail": { x: 20, y: 380 },
-    "text.txt": { x: 20, y: 470 },
+    "text.txt": { x: 20, y: 380 },
     "Snake": { x: 115, y: 20 },
     "Terminal": { x: 115, y: 110 },
     "Paint": { x: 115, y: 200 },
@@ -680,13 +692,16 @@ export function setWallpaper(url) {
 }
 
 // Sanitize and ensure core folders (Socials, Links, Music) are intact
-function sanitizeDesktopData(data) {
+export function sanitizeDesktopData(data) {
     if (!Array.isArray(data) || data.length === 0) return [...desktopData];
     const defaultSocials = desktopData.find(d => d.name === "Socials");
     const defaultLinks = desktopData.find(d => d.name === "Links");
     const defaultMusic = desktopData.find(d => d.name === "Music");
 
-    const result = data.map(item => {
+    // Filter out root-level Mail app if previously injected
+    const filteredData = data.filter(d => d && !(d.name === "Mail" || d.type === "mail"));
+
+    const result = filteredData.map(item => {
         if (!item || typeof item !== 'object') return item;
         if (item.name === "Socials") {
             if (!item.content || item.content.length === 0) {
@@ -718,23 +733,29 @@ function sanitizeDesktopData(data) {
     if (!result.some(d => d.name === "CS2" || d.type === "cs2")) {
         result.push({ name: "CS2", type: "cs2", content: [] });
     }
-    if (!result.some(d => d.name === "Mail" || d.type === "mail")) {
-        const cs2Idx = result.findIndex(d => d.name === "CS2" || d.type === "cs2");
-        if (cs2Idx !== -1) {
-            result.splice(cs2Idx + 1, 0, { name: "Mail", type: "mail" });
-        } else {
-            result.push({ name: "Mail", type: "mail" });
+
+    // Ensure Mail is inside Socials folder
+    const socialsItem = result.find(d => d.name === "Socials" && d.type === "folder");
+    if (socialsItem) {
+        if (!Array.isArray(socialsItem.content)) socialsItem.content = [];
+        if (!socialsItem.content.some(child => child && (child.name === "Mail" || child.type === "mail"))) {
+            socialsItem.content.unshift({ name: "Mail", type: "mail" });
         }
     }
+
     result.forEach(item => {
         if ((item.type === "stickynotes" || item.name === "Sticky Notes") && item.customIcon === "fluent:note-pin-24-filled") {
             delete item.customIcon;
         }
     });
 
-    if (!result.some(d => d.name === "Sticky Notes" || d.type === "stickynotes")) {
-        result.push({ name: "Sticky Notes", type: "stickynotes" });
-    }
+    desktopData.forEach(defaultItem => {
+        if (defaultItem.name === "Mail") return; // Keep Mail in Socials, not root
+        if (!result.some(d => d && d.name === defaultItem.name)) {
+            result.push({ ...defaultItem });
+        }
+    });
+
     return result;
 }
 
@@ -1342,144 +1363,13 @@ function renderDesktop() {
             badgeHTML = `<div class="hidden-for-guest-badge" title="Hidden for guest"><iconify-icon icon="fluent:eye-off-24-filled" width="13" height="13"></iconify-icon></div>`;
         }
 
-        const pos = (currentDesktopPositions && currentDesktopPositions[item.name])
-            || (DEFAULT_DESKTOP_ICON_POSITIONS && DEFAULT_DESKTOP_ICON_POSITIONS[item.name])
-            || { x: 20 + Math.floor(index / 6) * 95, y: 20 + (index % 6) * 90 };
-        iconDiv.style.position = "absolute";
-        iconDiv.style.left = `${pos.x}px`;
-        iconDiv.style.top = `${pos.y}px`;
-        iconDiv.style.margin = "0";
-
         iconDiv.innerHTML = `
             ${badgeHTML}
             ${getIconHTML(item, "large")}
             <span>${escapeHTML(item.name)}</span>
         `;
 
-        let didMovePointer = false;
-
-        // Drag & drop icon re-arranging and moving across the screen for Admin
-        if (currentUser === "admin") {
-            iconDiv.setAttribute("draggable", "true");
-            iconDiv.addEventListener("dragstart", (e) => {
-                const rect = iconDiv.getBoundingClientRect();
-                e.dataTransfer.setData("application/json", JSON.stringify({
-                    source: "desktop",
-                    index,
-                    name: item.name,
-                    offsetX: e.clientX - rect.left,
-                    offsetY: e.clientY - rect.top
-                }));
-                iconDiv.classList.add("dragging");
-            });
-            iconDiv.addEventListener("dragend", () => {
-                iconDiv.classList.remove("dragging");
-            });
-
-            // Direct tactile pointer drag for moving icons anywhere on desktop
-            let isDragging = false;
-            let startX = 0, startY = 0;
-            let initialLeft = 0, initialTop = 0;
-
-            iconDiv.addEventListener("mousedown", (e) => {
-                if (e.button !== 0) return;
-                const desktop = document.getElementById("desktop");
-                if (!desktop) return;
-                const deskRect = desktop.getBoundingClientRect();
-                const iconRect = iconDiv.getBoundingClientRect();
-
-                startX = e.clientX;
-                startY = e.clientY;
-                initialLeft = iconRect.left - deskRect.left;
-                initialTop = iconRect.top - deskRect.top;
-                didMovePointer = false;
-
-                const onMove = (ev) => {
-                    const dx = ev.clientX - startX;
-                    const dy = ev.clientY - startY;
-                    if (!didMovePointer && Math.hypot(dx, dy) > 6) {
-                        didMovePointer = true;
-                        isDragging = true;
-                        iconDiv.classList.add("dragging");
-                        iconDiv.style.position = "absolute";
-                        iconDiv.style.margin = "0";
-                        iconDiv.style.zIndex = "9999";
-                    }
-                    if (isDragging) {
-                        let curX = Math.round(initialLeft + dx);
-                        let curY = Math.round(initialTop + dy);
-                        curX = Math.max(10, Math.min(deskRect.width - 85, curX));
-                        curY = Math.max(10, Math.min(deskRect.height - 110, curY));
-                        iconDiv.style.left = `${curX}px`;
-                        iconDiv.style.top = `${curY}px`;
-                    }
-                };
-
-                const onUp = (ev) => {
-                    document.removeEventListener("mousemove", onMove);
-                    document.removeEventListener("mouseup", onUp);
-                    if (isDragging) {
-                        isDragging = false;
-                        iconDiv.classList.remove("dragging");
-                        iconDiv.style.zIndex = "";
-                        const dx = ev.clientX - startX;
-                        const dy = ev.clientY - startY;
-                        let finalX = Math.round(initialLeft + dx);
-                        let finalY = Math.round(initialTop + dy);
-                        finalX = Math.max(10, Math.min(deskRect.width - 85, finalX));
-                        finalY = Math.max(10, Math.min(deskRect.height - 110, finalY));
-
-                        currentDesktopPositions[item.name] = { x: finalX, y: finalY };
-                        saveDesktopPositions(currentDesktopPositions);
-                        showToast(`Repositioned "${item.name}"`);
-                    }
-                };
-
-                document.addEventListener("mousemove", onMove);
-                document.addEventListener("mouseup", onUp);
-            });
-
-            if (item.type === "folder") {
-                iconDiv.setAttribute("data-is-folder", "true");
-                iconDiv.addEventListener("dragover", (e) => {
-                    e.preventDefault();
-                    iconDiv.classList.add("folder-drop-hover");
-                });
-                iconDiv.addEventListener("dragleave", () => {
-                    iconDiv.classList.remove("folder-drop-hover");
-                });
-                iconDiv.addEventListener("drop", (e) => {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    iconDiv.classList.remove("folder-drop-hover");
-                    try {
-                        const raw = e.dataTransfer.getData("application/json");
-                        if (!raw) return;
-                        const data = JSON.parse(raw);
-                        if (data.source === "desktop" && typeof data.index === "number" && data.index !== index) {
-                            const [moved] = currentDesktopData.splice(data.index, 1);
-                            if (!item.content) item.content = [];
-                            item.content.push(moved);
-                            if (currentDesktopPositions[moved.name]) {
-                                delete currentDesktopPositions[moved.name];
-                                saveDesktopPositions(currentDesktopPositions);
-                            }
-                            saveDesktopData(currentDesktopData);
-                            renderDesktop();
-                            showToast(`Moved "${moved.name}" into "${item.name}"`);
-                        }
-                    } catch (err) {
-                        console.error("Drop error:", err);
-                    }
-                });
-            }
-        }
-
         iconDiv.addEventListener("click", () => {
-            if (didMovePointer) {
-                didMovePointer = false;
-                return;
-            }
             handleItemClick(item);
         });
 
@@ -1491,97 +1381,12 @@ function renderDesktop() {
         const adminIconDiv = document.createElement("div");
         adminIconDiv.className = "icon admin-desktop-icon";
         adminIconDiv.id = "desktop-icon-admin";
-        const adminPos = (currentDesktopPositions && currentDesktopPositions["Admin Settings"])
-            || (DEFAULT_DESKTOP_ICON_POSITIONS && DEFAULT_DESKTOP_ICON_POSITIONS["Admin Settings"])
-            || { x: 210, y: 20 };
-        adminIconDiv.style.position = "absolute";
-        adminIconDiv.style.left = `${adminPos.x}px`;
-        adminIconDiv.style.top = `${adminPos.y}px`;
-        adminIconDiv.style.margin = "0";
         adminIconDiv.innerHTML = `
             <iconify-icon icon="fluent:settings-24-filled" width="44" height="44" style="color: #ff8c00; filter: drop-shadow(0 2px 8px rgba(255, 140, 0, 0.4));"></iconify-icon>
             <span>Admin Settings</span>
         `;
-        adminIconDiv.setAttribute("draggable", "true");
-        adminIconDiv.addEventListener("dragstart", (e) => {
-            const rect = adminIconDiv.getBoundingClientRect();
-            e.dataTransfer.setData("application/json", JSON.stringify({
-                source: "desktop",
-                name: "Admin Settings",
-                offsetX: e.clientX - rect.left,
-                offsetY: e.clientY - rect.top
-            }));
-            adminIconDiv.classList.add("dragging");
-        });
-        adminIconDiv.addEventListener("dragend", () => {
-            adminIconDiv.classList.remove("dragging");
-        });
-
-        let didMoveAdminPointer = false;
-        adminIconDiv.addEventListener("mousedown", (e) => {
-            if (e.button !== 0) return;
-            const desktop = document.getElementById("desktop");
-            if (!desktop) return;
-            const deskRect = desktop.getBoundingClientRect();
-            const iconRect = adminIconDiv.getBoundingClientRect();
-
-            let startX = e.clientX;
-            let startY = e.clientY;
-            let initialLeft = iconRect.left - deskRect.left;
-            let initialTop = iconRect.top - deskRect.top;
-            didMoveAdminPointer = false;
-            let isDraggingAdmin = false;
-
-            const onMove = (ev) => {
-                const dx = ev.clientX - startX;
-                const dy = ev.clientY - startY;
-                if (!didMoveAdminPointer && Math.hypot(dx, dy) > 6) {
-                    didMoveAdminPointer = true;
-                    isDraggingAdmin = true;
-                    adminIconDiv.classList.add("dragging");
-                    adminIconDiv.style.position = "absolute";
-                    adminIconDiv.style.margin = "0";
-                    adminIconDiv.style.zIndex = "9999";
-                }
-                if (isDraggingAdmin) {
-                    let curX = Math.round(initialLeft + dx);
-                    let curY = Math.round(initialTop + dy);
-                    curX = Math.max(10, Math.min(deskRect.width - 85, curX));
-                    curY = Math.max(10, Math.min(deskRect.height - 110, curY));
-                    adminIconDiv.style.left = `${curX}px`;
-                    adminIconDiv.style.top = `${curY}px`;
-                }
-            };
-
-            const onUp = (ev) => {
-                document.removeEventListener("mousemove", onMove);
-                document.removeEventListener("mouseup", onUp);
-                if (isDraggingAdmin) {
-                    isDraggingAdmin = false;
-                    adminIconDiv.classList.remove("dragging");
-                    adminIconDiv.style.zIndex = "";
-                    const dx = ev.clientX - startX;
-                    const dy = ev.clientY - startY;
-                    let finalX = Math.round(initialLeft + dx);
-                    let finalY = Math.round(initialTop + dy);
-                    finalX = Math.max(10, Math.min(deskRect.width - 85, finalX));
-                    finalY = Math.max(10, Math.min(deskRect.height - 110, finalY));
-
-                    currentDesktopPositions["Admin Settings"] = { x: finalX, y: finalY };
-                    saveDesktopPositions(currentDesktopPositions);
-                    showToast(`Repositioned "Admin Settings"`);
-                }
-            };
-
-            document.addEventListener("mousemove", onMove);
-            document.addEventListener("mouseup", onUp);
-        });
 
         adminIconDiv.addEventListener("click", () => {
-            if (didMoveAdminPointer) {
-                didMoveAdminPointer = false;
-                return;
-            }
             openAdminEditMode();
         });
         container.appendChild(adminIconDiv);
@@ -1784,14 +1589,22 @@ export function openWindow(title, contentHTML, iconHTML = "", customId = null, e
     }
 
     win.querySelector(".close").addEventListener("click", () => {
-        win.remove();
-        activeWindows = activeWindows.filter(w => w.id !== id);
-        updateTaskbar();
+        closeWindow(win);
     });
 
     activeWindows.push({ id, title, iconHTML });
     updateTaskbar();
     return win;
+}
+
+// Global window closer
+export function closeWindow(winOrId) {
+    const win = typeof winOrId === 'string' ? document.getElementById(winOrId) : winOrId;
+    if (!win) return;
+    const id = win.id;
+    win.remove();
+    activeWindows = activeWindows.filter(w => w.id !== id);
+    updateTaskbar();
 }
 
 // Currently targeted folder for file uploads & context actions
@@ -3101,52 +2914,9 @@ function attachMailAppEvents(win) {
     }
 }
 
-// Setup Desktop Drop Zone for moving icons across the screen (Admin only)
+// Desktop icons are stationary and do not move
 export function setupDesktopDropZone() {
-    const desktop = document.getElementById("desktop");
-    const container = document.getElementById("desktopIcons");
-    if (!desktop) return;
-
-    const onDragOver = (e) => {
-        if (currentUser !== "admin") return;
-        if (e.target.closest(".icon[data-is-folder='true']")) return;
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
-    };
-
-    const onDrop = (e) => {
-        if (currentUser !== "admin") return;
-        if (e.target.closest(".icon[data-is-folder='true']")) return;
-        e.preventDefault();
-        try {
-            const raw = e.dataTransfer.getData("application/json");
-            if (!raw) return;
-            const data = JSON.parse(raw);
-            if (data.source === "desktop" && data.name) {
-                const deskRect = desktop.getBoundingClientRect();
-                const offsetX = data.offsetX || 36;
-                const offsetY = data.offsetY || 36;
-                let x = Math.round(e.clientX - deskRect.left - offsetX);
-                let y = Math.round(e.clientY - deskRect.top - offsetY);
-                x = Math.max(10, Math.min(deskRect.width - 85, x));
-                y = Math.max(10, Math.min(deskRect.height - 110, y));
-
-                currentDesktopPositions[data.name] = { x, y };
-                saveDesktopPositions(currentDesktopPositions);
-                renderDesktop();
-                showToast(`Repositioned "${data.name}"`);
-            }
-        } catch (err) {
-            console.error("Desktop drop error:", err);
-        }
-    };
-
-    desktop.addEventListener("dragover", onDragOver);
-    desktop.addEventListener("drop", onDrop);
-    if (container) {
-        container.addEventListener("dragover", onDragOver);
-        container.addEventListener("drop", onDrop);
-    }
+    // Icons are stationary; no drag repositioning
 }
 
 // ==========================================================================
@@ -3155,13 +2925,15 @@ export function setupDesktopDropZone() {
 let cs2CurrentView = "video"; // 'video' | 'stats'
 let cs2VideoXTimer = null;
 
-export function saveCs2Config(newConfig) {
+export async function saveCs2Config(newConfig) {
     currentCs2Config = { ...DEFAULT_CS2_CONFIG, ...newConfig };
     saveLocalOverride("cs2Config", currentCs2Config);
     if (currentUser === "admin") {
-        saveRemoteConfig("cs2Config", currentCs2Config).catch(err => {
+        try {
+            await saveCs2ConfigToDb(currentCs2Config);
+        } catch (err) {
             console.warn("Firebase CS2 config save warning:", err);
-        });
+        }
     }
 }
 
@@ -3260,17 +3032,27 @@ function renderCs2OverlayContent(overlay) {
         cs2VideoXTimer = null;
     }
 
-    // Top-right X button: transparent, appearing after 3s in video mode
+    // Top-right action buttons in video/stats mode
     const xBtn = document.createElement("button");
     xBtn.id = "cs2-top-x-btn";
     xBtn.innerHTML = "✕";
 
     if (cs2CurrentView === "video") {
+        // Sound toggle button next to X button
+        const soundBtn = document.createElement("button");
+        soundBtn.id = "cs2-sound-toggle-btn";
+        soundBtn.className = "cs2-sound-btn cs2-x-video-delayed";
+        soundBtn.innerHTML = "🔇";
+        soundBtn.title = "Toggle Sound";
+        overlay.appendChild(soundBtn);
+
         xBtn.className = "cs2-x-btn cs2-x-btn-transparent cs2-x-video-delayed";
         xBtn.title = "View CS2 & Leetify Stats (Skip Cover Video)";
         cs2VideoXTimer = setTimeout(() => {
             xBtn.classList.add("is-visible");
-        }, 3000);
+            soundBtn.classList.add("is-visible");
+        }, 1500);
+
         xBtn.addEventListener("click", () => {
             if (cs2VideoXTimer) clearTimeout(cs2VideoXTimer);
             cs2CurrentView = "stats";
@@ -3293,56 +3075,193 @@ function renderCs2OverlayContent(overlay) {
     }
 }
 
+export function resolveCs2VideoUrl(url) {
+    if (!url) return "/cs2-cinematic.mp4";
+    const trimmed = String(url).trim();
+    if (!trimmed || trimmed === "/cs2-cinematic.mp4") return "/cs2-cinematic.mp4";
+
+    // If it is the default mixkit template link or local reference
+    if (trimmed.includes("mixkit") || trimmed.includes("cs2-cinematic.mp4")) {
+        return "/cs2-cinematic.mp4";
+    }
+
+    const driveId = extractGoogleDriveId(trimmed);
+    if (driveId) {
+        // If it matches the user's specific Drive video, local copy is instantly available
+        if (driveId === "1K31UotdiJzBZqPuif1Qw61R6_QqQdCh9") {
+            return "/cs2-cinematic.mp4";
+        }
+        // Proxy any other Google Drive video with HTTP Range partial content support
+        return `/api/video-stream?id=${encodeURIComponent(driveId)}`;
+    }
+
+    return trimmed;
+}
+
 function renderCs2VideoView(overlay) {
     const videoWrap = document.createElement("div");
     videoWrap.className = "cs2-video-view";
 
-    const videoUrl = currentCs2Config.videoUrl || DEFAULT_CS2_CONFIG.videoUrl;
+    const videoUrl = (currentCs2Config.videoUrl || DEFAULT_CS2_CONFIG.videoUrl || "").trim();
     const isYT = isYouTubeTrack({ src: videoUrl });
     const ytId = isYT ? extractYouTubeId(videoUrl) : null;
-    const isDrive = isGoogleDriveTrack({ src: videoUrl }) || (typeof videoUrl === "string" && (videoUrl.includes("drive.google.com") || videoUrl.includes("docs.google.com")));
-    const driveId = isDrive ? extractGoogleDriveId(videoUrl) : null;
 
-    let mediaHTML = "";
     if (isYT && ytId) {
         // YouTube embed without controls or branding
-        mediaHTML = `
+        videoWrap.innerHTML = `
             <div class="cs2-video-host">
-                <iframe id="cs2-yt-video-frame" src="https://www.youtube.com/embed/${ytId}?autoplay=1&controls=0&mute=1&loop=1&playlist=${ytId}&rel=0&modestbranding=1&iv_load_policy=3&disablekb=1&playsinline=1" allow="autoplay; fullscreen" allowfullscreen></iframe>
+                <iframe id="cs2-yt-video-frame" class="cs2-yt-video-frame" src="https://www.youtube.com/embed/${ytId}?autoplay=1&controls=0&mute=1&loop=1&playlist=${ytId}&rel=0&modestbranding=1&iv_load_policy=3&disablekb=1&playsinline=1" allow="autoplay; fullscreen" allowfullscreen></iframe>
             </div>
         `;
-    } else {
-        // Direct HTML5 cover video (streamed via proxy for Google Drive to eliminate Google Drive headers, seeker, and open-in-new-window icons)
-        const directSrc = (isDrive && driveId) ? `/api/drive-video?id=${encodeURIComponent(driveId)}` : videoUrl;
-        mediaHTML = `
-            <div class="cs2-video-host">
-                <video id="cs2-active-video" class="cs2-cover-video-element" src="${directSrc}" autoplay loop muted playsinline preload="auto"></video>
-            </div>
-        `;
+        overlay.appendChild(videoWrap);
+        return;
     }
 
-    videoWrap.innerHTML = mediaHTML;
+    // Direct Native HTML5 Cover Video:
+    // Pure, control-free cinematic cover video with instant autoplay and zero clutter.
+    const hostDiv = document.createElement("div");
+    hostDiv.className = "cs2-video-host";
+
+    const videoEl = document.createElement("video");
+    videoEl.id = "cs2-active-video";
+    videoEl.className = "cs2-cover-video-element";
+    videoEl.autoplay = true;
+    videoEl.loop = true;
+    videoEl.muted = true;
+    videoEl.defaultMuted = true;
+    videoEl.playsInline = true;
+    videoEl.setAttribute("playsinline", "");
+    videoEl.setAttribute("webkit-playsinline", "");
+    videoEl.setAttribute("muted", "");
+    videoEl.setAttribute("loop", "");
+    videoEl.setAttribute("autoplay", "");
+    videoEl.setAttribute("preload", "auto");
+    videoEl.crossOrigin = "anonymous";
+
+    const resolvedSrc = resolveCs2VideoUrl(videoUrl);
+    videoEl.src = resolvedSrc;
+
+    const sourceEl = document.createElement("source");
+    sourceEl.src = resolvedSrc;
+    sourceEl.type = "video/mp4";
+    videoEl.appendChild(sourceEl);
+
+    hostDiv.appendChild(videoEl);
+    videoWrap.appendChild(hostDiv);
     overlay.appendChild(videoWrap);
 
-    const videoEl = videoWrap.querySelector("video");
-    if (videoEl) {
-        videoEl.play().catch(e => {
-            console.warn("Autoplay audio policy fallback:", e);
-            videoEl.muted = true;
-            videoEl.play().catch(() => {});
-        });
-        videoEl.addEventListener("error", () => {
-            if (isDrive && driveId && !videoEl.dataset.fallbackTried) {
-                videoEl.dataset.fallbackTried = "true";
-                videoEl.src = `https://drive.usercontent.google.com/download?id=${driveId}&export=download&confirm=t`;
-                videoEl.play().catch(() => {});
+    // Sound toggle and state management
+    const soundBtn = document.getElementById("cs2-sound-toggle-btn");
+    const updateSoundBtnUI = () => {
+        if (!soundBtn) return;
+        soundBtn.innerHTML = videoEl.muted ? "🔇" : "🔊";
+        soundBtn.title = videoEl.muted ? "Sound Muted (Click to unmute)" : "Sound Playing (Click to mute)";
+    };
+
+    if (soundBtn) {
+        soundBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            videoEl.muted = !videoEl.muted;
+            videoEl.defaultMuted = videoEl.muted;
+            updateSoundBtnUI();
+            if (!videoEl.muted && videoEl.paused) {
+                videoEl.play().catch(err => console.warn("Unmute play error:", err));
             }
         });
-        videoEl.addEventListener("ended", () => {
-            cs2CurrentView = "stats";
-            renderCs2OverlayContent(overlay);
-        });
     }
+
+    // Clicking the background video toggles mute or resumes if paused
+    videoEl.addEventListener("click", () => {
+        if (videoEl.paused) {
+            videoEl.play().catch(() => {});
+        } else {
+            videoEl.muted = !videoEl.muted;
+            videoEl.defaultMuted = videoEl.muted;
+            updateSoundBtnUI();
+        }
+    });
+
+    // Bulletproof playback initiation
+    let isActivelyPlaying = false;
+    const triggerPlay = () => {
+        if (isActivelyPlaying && !videoEl.paused) return;
+        
+        // Attempt unmuted first (since user initiated action by clicking CS2)
+        videoEl.muted = false;
+        videoEl.defaultMuted = false;
+        const playPromise = videoEl.play();
+        if (playPromise !== undefined) {
+            playPromise.then(() => {
+                isActivelyPlaying = true;
+                updateSoundBtnUI();
+            }).catch(policyErr => {
+                // If browser autoplay policy rejects sound, fallback to muted immediately
+                console.log("Autoplay audio policy enforced, switching to muted playback:", policyErr);
+                videoEl.muted = true;
+                videoEl.defaultMuted = true;
+                videoEl.play().then(() => {
+                    isActivelyPlaying = true;
+                    updateSoundBtnUI();
+                }).catch(mutedErr => {
+                    console.warn("Muted playback attempt error:", mutedErr);
+                });
+            });
+        }
+    };
+
+    // Attach play triggers across video lifecycle
+    videoEl.addEventListener("loadedmetadata", triggerPlay, { once: true });
+    videoEl.addEventListener("canplay", triggerPlay, { once: true });
+    videoEl.addEventListener("playing", () => {
+        isActivelyPlaying = true;
+        updateSoundBtnUI();
+    });
+
+    // Execute immediately with microtask safety
+    setTimeout(triggerPlay, 40);
+
+    // Fail-safe Blob fetch fallback: If browser Range request fails or gets stuck, load via direct fetch
+    let blobFallbackEngaged = false;
+    const engageBlobFallback = async () => {
+        if (blobFallbackEngaged || (isActivelyPlaying && !videoEl.paused && videoEl.currentTime > 0)) return;
+        blobFallbackEngaged = true;
+        console.log("Activating direct Blob fallback stream for CS2 video...");
+        try {
+            const resp = await fetch("/cs2-cinematic.mp4");
+            if (resp.ok) {
+                const blob = await resp.blob();
+                const blobUrl = URL.createObjectURL(blob);
+                videoEl.src = blobUrl;
+                videoEl.muted = true;
+                videoEl.defaultMuted = true;
+                videoEl.load();
+                videoEl.play().then(() => {
+                    isActivelyPlaying = true;
+                    updateSoundBtnUI();
+                }).catch(bErr => console.warn("Blob play failed:", bErr));
+            }
+        } catch (fErr) {
+            console.warn("Blob fetch failed:", fErr);
+        }
+    };
+
+    videoEl.addEventListener("error", (err) => {
+        console.warn("CS2 video error event on src:", videoEl.src, err);
+        engageBlobFallback();
+    });
+
+    // Timeout check: if after 1.5 seconds video hasn't progressed, trigger blob fallback
+    const fallbackTimer = setTimeout(() => {
+        if (videoEl.paused || videoEl.currentTime === 0) {
+            engageBlobFallback();
+        }
+    }, 1500);
+
+    videoEl.addEventListener("ended", () => {
+        clearTimeout(fallbackTimer);
+        cs2CurrentView = "stats";
+        renderCs2OverlayContent(overlay);
+    });
 }
 
 export function getPremierRatingColor(rating) {
@@ -4240,8 +4159,9 @@ export function openAdminEditMode() {
                 <div class="owner-subtext">Stats are retrieved automatically via your Leetify API key. No manual stats data entry required.</div>
 
                 <div class="owner-field">
-                    <label class="owner-label">Cover Video URL (Direct MP4, YouTube, Google Drive, or Web Video)</label>
-                    <input type="text" id="owner-cs2-video-url" class="owner-input" value="${escapeHTML(currentCs2Config.videoUrl || '')}" placeholder="https://.../video.mp4 or YouTube link" />
+                    <label class="owner-label">Cover Video URL (Google Drive link, YouTube URL, or direct MP4)</label>
+                    <input type="text" id="owner-cs2-video-url" class="owner-input" value="${escapeHTML(currentCs2Config.videoUrl || '')}" placeholder="Paste Google Drive link (e.g. drive.google.com/file/d/...)" />
+                    <div style="font-size: 11.5px; color: rgba(255,255,255,0.5); margin-top: 4px;">Supports any Google Drive share link (ensure sharing is set to 'Anyone with the link' in Drive).</div>
                 </div>
 
                 <div class="owner-field">
@@ -5309,6 +5229,7 @@ function renderStartMenuApps() {
     });
 
     const standardApps = [
+        { name: "Mail", type: "mail" },
         { name: "Calculator", type: "calculator", customIcon: "fluent:calculator-24-filled" },
         { name: "Paint", type: "paint", customIcon: "fluent:paint-brush-24-filled" },
         { name: "Terminal", type: "terminal", customIcon: "fluent:window-console-20-filled" },
@@ -6292,6 +6213,16 @@ window.addEventListener("keydown", (e) => {
         return;
     }
 
+    // CS2 Fullscreen overlay Escape key exit
+    if (e.key === "Escape") {
+        const cs2Overlay = document.getElementById("cs2-fullscreen-overlay");
+        if (cs2Overlay && cs2Overlay.style.display !== "none") {
+            e.preventDefault();
+            closeCs2Experience();
+            return;
+        }
+    }
+
     // Guest Welcome enter key shortcut on lockscreen
     const lockScreen = document.getElementById("lock-screen");
     if (lockScreen && lockScreen.style.display !== "none") {
@@ -6338,6 +6269,12 @@ window.openStickyNotes = openStickyNotes;
 window.openMusicUploadModal = openMusicUploadModal;
 window.closeMusicUploadModal = closeMusicUploadModal;
 window.playRandomTrack = playRandomTrack;
+window.openMailApp = openMailApp;
+window.closeWindow = closeWindow;
+window.saveLocalOverride = saveLocalOverride;
+window.saveRemoteConfig = saveRemoteConfig;
+window.saveCs2Config = saveCs2Config;
+window.resolveCs2VideoUrl = resolveCs2VideoUrl;
 
 // ==========================================================================
 // STICKY NOTES SYSTEM
